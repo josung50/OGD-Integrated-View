@@ -7,7 +7,7 @@ from mcp.client.stdio import stdio_client
 from ogd_integrated_view.mcp.base import McpServerDefinition
 
 
-async def call_tool(definition: McpServerDefinition) -> Any:
+async def call_tool(definition: McpServerDefinition, question: str | None = None) -> Any:
     if definition.command is None:
         raise NotImplementedError("http/sse 방식 MCP 서버는 아직 미구현")
 
@@ -17,4 +17,4 @@ async def call_tool(definition: McpServerDefinition) -> Any:
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            return await session.call_tool(definition.tool_name, definition.build_arguments())
+            return await session.call_tool(definition.tool_name, definition.build_arguments(question))

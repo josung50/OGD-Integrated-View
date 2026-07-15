@@ -2,6 +2,7 @@ import streamlit as st
 
 from ogd_integrated_view.dashboard.backend import query_law, query_real_estate
 from ogd_integrated_view.dashboard.chat import render_chat_tab
+from ogd_integrated_view.dashboard.settings import render_settings_tab
 
 
 def main() -> None:
@@ -9,7 +10,9 @@ def main() -> None:
     st.title("OGD Integrated View")
     st.write("궁금한 내용을 편하게 질문해보세요. 각 탭은 해당 공공데이터에만 답합니다.")
 
-    tab_real_estate, tab_law = st.tabs(["🏠 부동산정보확인", "⚖️ 법령 및 판례"])
+    tab_real_estate, tab_law, tab_settings = st.tabs(
+        ["🏠 부동산정보확인", "⚖️ 법령 및 판례", "⚙️ 설정"]
+    )
 
     with tab_real_estate:
         render_chat_tab(
@@ -28,6 +31,9 @@ def main() -> None:
             examples=["주택임대차보호법 조항", "임대차 관련 판례"],
             query_fn=query_law,
         )
+
+    with tab_settings:
+        render_settings_tab()
 
 
 if __name__ == "__main__":

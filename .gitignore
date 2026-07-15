@@ -14,3 +14,4 @@ wheels/
 
 # Generated data
 data/*.xlsx
+data/mcp_servers.json
