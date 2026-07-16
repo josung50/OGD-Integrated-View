@@ -15,12 +15,19 @@ CATEGORY_META: dict[str, dict[str, str]] = {
 }
 
 
-def render_kakao_map(center: dict[str, Any] | None, categories: dict[str, dict[str, Any]]) -> None:
+def render_kakao_map(
+    center: dict[str, Any] | None,
+    categories: dict[str, dict[str, Any]],
+    focused_point: dict[str, Any] | None = None,
+) -> None:
     """중심 위치와 카테고리별 주변 지점을 카카오맵에 색상별 마커+거리선으로 그린다.
 
     categories는 {키: {"meta": {"label", "icon", "color"}, "points": [...]}} 형태여야 한다 —
     호출부가 어떤 카테고리를 어떤 색으로 보여줄지 직접 정하도록, 이 함수는 특정 카테고리
     이름을 알지 못한다 (채팅 흐름의 단일 결과든, 대시보드의 4분류든 그대로 재사용 가능).
+
+    focused_point(lat/lon/label)를 주면 지도가 전체 지점을 다 보여주는 대신 그 지점으로
+    이동·확대된다 — 목록에서 특정 항목을 골랐을 때 그 위치로 바로 찾아가는 용도.
     """
     js_key = load_app_settings().get("kakao_js_key")
     if not js_key:
@@ -41,6 +48,7 @@ def render_kakao_map(center: dict[str, Any] | None, categories: dict[str, dict[s
 
     center_json = json.dumps(center, ensure_ascii=False)
     categories_json = json.dumps(categories, ensure_ascii=False)
+    focused_point_json = json.dumps(focused_point, ensure_ascii=False)
 
     html = f"""
     <div id="{element_id}" style="width:100%;height:600px;border-radius:8px;"></div>
@@ -49,6 +57,7 @@ def render_kakao_map(center: dict[str, Any] | None, categories: dict[str, dict[s
     kakao.maps.load(function () {{
         var center = {center_json};
         var categories = {categories_json};
+        var focusedPoint = {focused_point_json};
         var container = document.getElementById('{element_id}');
         var map = new kakao.maps.Map(container, {{
             center: new kakao.maps.LatLng(center.lat, center.lon),
@@ -72,6 +81,8 @@ def render_kakao_map(center: dict[str, Any] | None, categories: dict[str, dict[s
         }});
         centerInfo.open(map, centerMarker);
 
+        var focusedOverlay = null;
+
         Object.keys(categories).forEach(function (key) {{
             var group = categories[key];
             var color = group.meta.color;
@@ -80,45 +91,58 @@ def render_kakao_map(center: dict[str, Any] | None, categories: dict[str, dict[s
                 var pos = new kakao.maps.LatLng(point.lat, point.lon);
                 bounds.extend(pos);
 
+                var isFocused = focusedPoint && focusedPoint.lat === point.lat && focusedPoint.lon === point.lon;
+
                 var dot = document.createElement('div');
-                dot.style.width = '14px';
-                dot.style.height = '14px';
+                dot.style.width = isFocused ? '20px' : '14px';
+                dot.style.height = isFocused ? '20px' : '14px';
                 dot.style.borderRadius = '50%';
                 dot.style.background = color;
-                dot.style.border = '2px solid #fff';
-                dot.style.boxShadow = '0 0 3px rgba(0,0,0,0.5)';
+                dot.style.border = isFocused ? '3px solid #FFD700' : '2px solid #fff';
+                dot.style.boxShadow = isFocused ? '0 0 8px rgba(0,0,0,0.7)' : '0 0 3px rgba(0,0,0,0.5)';
 
-                new kakao.maps.CustomOverlay({{
+                var overlay = new kakao.maps.CustomOverlay({{
                     position: pos,
                     content: dot,
                     map: map,
+                    zIndex: isFocused ? 100 : 1,
                 }});
+                if (isFocused) {{
+                    focusedOverlay = overlay;
+                }}
 
                 var distanceLabel = point.distance_m >= 1000
                     ? (point.distance_m / 1000).toFixed(1) + 'km'
                     : point.distance_m + 'm';
                 var labelContent = '<div style="padding:2px 6px;font-size:11px;background:#fff;' +
-                    'border:1px solid ' + color + ';border-radius:4px;white-space:nowrap;">' +
+                    'border:1px solid ' + color + ';border-radius:4px;white-space:nowrap;' +
+                    (isFocused ? 'font-weight:bold;' : '') + '">' +
                     point.name + ' · ' + distanceLabel + '</div>';
                 new kakao.maps.CustomOverlay({{
                     position: pos,
                     content: labelContent,
                     yAnchor: 2.4,
                     map: map,
+                    zIndex: isFocused ? 100 : 1,
                 }});
 
                 new kakao.maps.Polyline({{
                     path: [centerPos, pos],
-                    strokeWeight: 2,
+                    strokeWeight: isFocused ? 3 : 2,
                     strokeColor: color,
-                    strokeOpacity: 0.6,
+                    strokeOpacity: isFocused ? 0.9 : 0.6,
                     strokeStyle: 'shortdash',
                     map: map,
                 }});
             }});
         }});
 
-        map.setBounds(bounds);
+        if (focusedPoint) {{
+            map.setCenter(new kakao.maps.LatLng(focusedPoint.lat, focusedPoint.lon));
+            map.setLevel(3);
+        }} else {{
+            map.setBounds(bounds);
+        }}
 
         var legend = document.createElement('div');
         legend.style.position = 'absolute';

@@ -10,6 +10,8 @@ from ogd_integrated_view.mcp.location_pipeline import analyze_all
 from ogd_integrated_view.mcp.registry import find_server_by_role
 
 _RESULT_KEY = "location_dashboard_result"
+_FOCUS_POINT_KEY = "location_dashboard_focus_point"
+_PREV_SELECTION_KEY = "location_dashboard_prev_selection"
 
 
 def render_location_dashboard() -> None:
@@ -51,8 +53,10 @@ def render_location_dashboard() -> None:
                 with st.spinner("반경 내 지하철역·편의시설·인프라·실거래를 조회하는 중..."):
                     st.session_state[_RESULT_KEY] = asyncio.run(analyze_all(server, address, radius_km))
                 # 새로 분석한 주소로 대화 맥락이 바뀌었으니, 이전 주소를 기준으로 오가던
-                # 채팅 기록은 비워서 서로 다른 주소가 섞여 답변에 쓰이지 않게 한다.
+                # 채팅 기록·지도 포커스는 비워서 이전 주소와 섞이지 않게 한다.
                 st.session_state["location_analysis_chat"] = []
+                st.session_state[_FOCUS_POINT_KEY] = None
+                st.session_state[_PREV_SELECTION_KEY] = {}
 
     result = st.session_state.get(_RESULT_KEY)
     if not result:
@@ -61,14 +65,18 @@ def render_location_dashboard() -> None:
         st.warning("주소를 좌표로 변환하지 못했습니다. 더 구체적인 주소를 입력해보세요.")
         return
 
-    col_map, col_tabs = st.columns([3, 1])
-    with col_map:
-        categories = {
-            key: {"meta": CATEGORY_META[key], "points": points}
-            for key, points in result["categories"].items()
-        }
-        render_kakao_map(result["center"], categories)
+    categories = {
+        key: {"meta": CATEGORY_META[key], "points": points} for key, points in result["categories"].items()
+    }
 
+    # 여러 팝오버의 표에 각각 선택 상태가 남아있을 수 있어서, 이전 실행과 비교해
+    # "방금 새로 클릭된" 표만 지도 포커스를 바꾸도록 한다 (아니면 다른 탭에 남아있던
+    # 예전 선택 때문에 방금 누른 항목이 무시될 수 있다).
+    prev_selection: dict[str, tuple[int, ...]] = st.session_state.setdefault(_PREV_SELECTION_KEY, {})
+    current_selection: dict[str, tuple[int, ...]] = {}
+    new_focus_point = None
+
+    col_map, col_tabs = st.columns([3, 1])
     with col_tabs:
         for key, meta in CATEGORY_META.items():
             points = result["categories"].get(key, [])
@@ -85,11 +93,41 @@ def render_location_dashboard() -> None:
                                 "이름": p["name"],
                                 "거리": f"{p['distance_m']}m" if p["distance_m"] < 1000 else f"{p['distance_m'] / 1000:.1f}km",
                                 "정보": p.get("detail", ""),
+                                **({"거래일": p.get("date", "")} if key == "transactions" else {}),
                             }
                             for p in points
                         ]
                     )
-                    st.dataframe(df, hide_index=True, use_container_width=True)
+                    st.caption("행을 클릭하면 지도가 그 위치로 이동합니다.")
+                    event = st.dataframe(
+                        df,
+                        hide_index=True,
+                        use_container_width=True,
+                        on_select="rerun",
+                        selection_mode="single-row",
+                        key=f"location_dashboard_table_{key}",
+                    )
+                    selected_rows = tuple(event.selection.rows) if event and event.selection else ()
+                    current_selection[key] = selected_rows
+                    if selected_rows and selected_rows != prev_selection.get(key):
+                        selected = points[selected_rows[0]]
+                        new_focus_point = {
+                            "lat": selected["lat"],
+                            "lon": selected["lon"],
+                            "label": selected["name"],
+                        }
+
+    st.session_state[_PREV_SELECTION_KEY] = current_selection
+    if new_focus_point:
+        st.session_state[_FOCUS_POINT_KEY] = new_focus_point
+
+    focused_point = st.session_state.get(_FOCUS_POINT_KEY)
+    with col_map:
+        if focused_point:
+            if st.button("↩️ 전체 보기로 돌아가기"):
+                st.session_state[_FOCUS_POINT_KEY] = None
+                focused_point = None
+        render_kakao_map(result["center"], categories, focused_point=focused_point)
 
     address_context = result["center"]["label"]
 

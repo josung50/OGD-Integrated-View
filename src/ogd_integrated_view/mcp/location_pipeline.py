@@ -22,6 +22,13 @@ def _tool_result_json(result: Any) -> dict[str, Any] | None:
         return None
 
 
+def _format_deal_date(deal_month: str, deal_day: str) -> str:
+    """'202601', '15' -> '2026.01.15' (둘 중 하나라도 없거나 형식이 다르면 빈 문자열)"""
+    if not deal_month or len(deal_month) != 6 or not deal_day.strip().isdigit():
+        return ""
+    return f"{deal_month[:4]}.{deal_month[4:6]}.{int(deal_day):02d}"
+
+
 async def analyze_all(server: McpServerDefinition, address: str, radius_km: float) -> dict[str, Any]:
     """지정한 주소 반경 내 지하철역/편의시설/주요 인프라/아파트 실거래를 한 번에 조회한다.
 
@@ -114,6 +121,7 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
                                     "lon": tx["lon"],
                                     "distance_m": tx.get("distance_m", 0),
                                     "detail": tx.get("price", ""),
+                                    "date": _format_deal_date(tx.get("deal_month", ""), tx.get("deal_day", "")),
                                 }
                             )
                 else:
