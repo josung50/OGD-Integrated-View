@@ -11,40 +11,9 @@ from ogd_integrated_view.mcp.config_store import (
 )
 
 ROLE_LABELS = {
-    "real_estate": "🏠 부동산정보확인",
-    "law": "⚖️ 법령 및 판례",
-    "real_estate_2": "🏠 부동산정보확인 2",
     "location_analysis": "📍 부동산 입지분석",
 }
-ROLES_WITHOUT_TOOL_NAME = {"real_estate", "real_estate_2", "location_analysis"}
-
-REAL_ESTATE_VENDOR_PATH = Path("vendor/real-estate-mcp").resolve()
-REAL_ESTATE_PRESET = {
-    "name": "real-estate",
-    "role": "real_estate",
-    "command": "uv",
-    "args": [
-        "run",
-        "--directory",
-        str(REAL_ESTATE_VENDOR_PATH),
-        "python",
-        "src/real_estate/mcp_server/server.py",
-    ],
-    "tool_name": "",
-    "query_param": "",
-    "extra_arguments": {},
-}
-
-REAL_ESTATE_2_VENDOR_PATH = Path("vendor/realestate-mcp").resolve()
-REAL_ESTATE_2_PRESET = {
-    "name": "realestate-mcp",
-    "role": "real_estate_2",
-    "command": "node",
-    "args": [str(REAL_ESTATE_2_VENDOR_PATH / "server.js")],
-    "tool_name": "",
-    "query_param": "",
-    "extra_arguments": {},
-}
+ROLES_WITHOUT_TOOL_NAME = {"location_analysis"}
 
 LOCATION_ANALYSIS_VENDOR_PATH = Path("vendor/A2A-MCP-RealEstate").resolve()
 LOCATION_ANALYSIS_PRESET = {
@@ -129,61 +98,17 @@ def render_settings_tab() -> None:
 
     st.divider()
 
-    st.subheader("빠른 설정 — 부동산 실거래가 (real-estate-mcp)")
-    st.caption("공공데이터포털에서 발급받은 API 키만 입력하면 나머지 접속 정보는 자동으로 채워집니다.")
-    api_key = st.text_input(
-        "DATA_GO_KR_API_KEY", type="password", key="quick_real_estate_api_key"
-    )
-    if st.button("부동산 MCP 저장", key="quick_real_estate_save"):
-        if not api_key:
-            st.error("API 키를 입력하세요.")
-        else:
-            servers = [s for s in servers if s.get("role") != "real_estate"]
-            servers.append({**REAL_ESTATE_PRESET, "env": {"DATA_GO_KR_API_KEY": api_key}})
-            save_servers(servers)
-            st.success("부동산 MCP 서버가 저장되었습니다.")
-            st.rerun()
-
-    st.divider()
-
-    st.subheader("빠른 설정 — 부동산 실거래가 2 (realestate-mcp)")
-    st.caption(
-        "지역명·아파트명·읍면동 필터를 tool이 직접 지원하는 서버입니다. "
-        "공공데이터포털 인증키는 동일 계정이면 위 서버와 같은 키를 그대로 써도 됩니다."
-    )
-    existing_key = next(
-        (s.get("env", {}).get("DATA_GO_KR_API_KEY", "") for s in servers if s.get("role") == "real_estate"),
-        "",
-    )
-    api_key_2 = st.text_input(
-        "REALESTATE_API_KEY", type="password", value=existing_key, key="quick_real_estate_2_api_key"
-    )
-    if st.button("부동산 MCP 2 저장", key="quick_real_estate_2_save"):
-        if not api_key_2:
-            st.error("API 키를 입력하세요.")
-        else:
-            servers = [s for s in servers if s.get("role") != "real_estate_2"]
-            servers.append({**REAL_ESTATE_2_PRESET, "env": {"REALESTATE_API_KEY": api_key_2}})
-            save_servers(servers)
-            st.success("부동산 MCP 2 서버가 저장되었습니다.")
-            st.rerun()
-
-    st.divider()
-
     st.subheader("빠른 설정 — 부동산 입지분석 (A2A-MCP-RealEstate)")
     st.caption(
         "지하철역/편의시설 거리 기반 입지 분석, 투자가치·삶의질 평가, 도로명 주소 검색을 지원합니다. "
-        "공공데이터포털 인증키(MOLIT)는 위와 동일 계정 키를 재사용할 수 있고, "
+        "공공데이터포털 인증키(MOLIT), "
         "네이버 지도 키는 [네이버클라우드플랫폼](https://www.ncloud.com/), "
-        "카카오 키는 [카카오 디벨로퍼스](https://developers.kakao.com/)에서 별도 발급해야 합니다."
+        "카카오 키는 [카카오 디벨로퍼스](https://developers.kakao.com/)에서 발급해야 합니다."
     )
     existing_location_env = next(
         (s.get("env", {}) for s in servers if s.get("role") == "location_analysis"), {}
     )
-    existing_molit_key = existing_location_env.get("MOLIT_API_KEY") or next(
-        (s.get("env", {}).get("DATA_GO_KR_API_KEY", "") for s in servers if s.get("role") == "real_estate"),
-        "",
-    )
+    existing_molit_key = existing_location_env.get("MOLIT_API_KEY", "")
     molit_key = st.text_input(
         "MOLIT_API_KEY", type="password", value=existing_molit_key, key="quick_location_molit_key"
     )

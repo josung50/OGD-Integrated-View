@@ -2,7 +2,6 @@ import asyncio
 import traceback
 from typing import Any
 
-from ogd_integrated_view.mcp.adapters.real_estate import query as query_real_estate_mcp
 from ogd_integrated_view.mcp.agent import ask as ask_cloud_agent
 from ogd_integrated_view.mcp.client import call_tool
 from ogd_integrated_view.mcp.config_store import load_app_settings
@@ -10,23 +9,11 @@ from ogd_integrated_view.mcp.local_agent import ask as ask_local_agent
 from ogd_integrated_view.mcp.registry import find_server_by_role
 
 
-def query_real_estate(question: str) -> dict[str, Any]:
-    return _query("real_estate", question, rule_based_query=query_real_estate_mcp)
-
-
-def query_real_estate_2(question: str) -> dict[str, Any]:
-    return _query("real_estate_2", question, rule_based_query=None)
-
-
 def query_location_analysis(question: str) -> dict[str, Any]:
-    return _query("location_analysis", question, rule_based_query=None)
+    return _query("location_analysis", question)
 
 
-def query_law(question: str) -> dict[str, Any]:
-    return _query("law", question, rule_based_query=None)
-
-
-def _query(role: str, question: str, rule_based_query) -> dict[str, Any]:
+def _query(role: str, question: str) -> dict[str, Any]:
     server = find_server_by_role(role)
     if server is None:
         return {"answer": _mock(question), "map": None}
@@ -40,9 +27,6 @@ def _query(role: str, question: str, rule_based_query) -> dict[str, Any]:
             return asyncio.run(ask_local_agent(server, question, local_model))
         if api_key:
             return asyncio.run(ask_cloud_agent(server, question, api_key))
-        if rule_based_query is not None:
-            answer = asyncio.run(rule_based_query(server, question))
-            return {"answer": answer, "map": None}
         result = asyncio.run(call_tool(server, question))
         return {"answer": _format_result(result), "map": None}
     except Exception as exc:

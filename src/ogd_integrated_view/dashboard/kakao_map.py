@@ -7,11 +7,20 @@ from ogd_integrated_view.mcp.config_store import load_app_settings
 
 _MAP_COUNTER_KEY = "_kakao_map_counter"
 
+CATEGORY_META: dict[str, dict[str, str]] = {
+    "subway": {"label": "지하철역", "icon": "🚇", "color": "#4285F4"},
+    "convenience": {"label": "편의시설", "icon": "🏪", "color": "#34A853"},
+    "infra": {"label": "주요 인프라", "icon": "🏥", "color": "#EA4335"},
+    "transactions": {"label": "아파트 실거래", "icon": "🏢", "color": "#A142F4"},
+}
 
-def render_kakao_map(map_data: dict[str, Any]) -> None:
-    """중심 위치와 주변 지점을 카카오맵에 마커+거리선으로 그린다.
 
-    JS 키가 설정되어 있지 않으면 지도 대신 안내 메시지만 보여준다.
+def render_kakao_map(center: dict[str, Any] | None, categories: dict[str, dict[str, Any]]) -> None:
+    """중심 위치와 카테고리별 주변 지점을 카카오맵에 색상별 마커+거리선으로 그린다.
+
+    categories는 {키: {"meta": {"label", "icon", "color"}, "points": [...]}} 형태여야 한다 —
+    호출부가 어떤 카테고리를 어떤 색으로 보여줄지 직접 정하도록, 이 함수는 특정 카테고리
+    이름을 알지 못한다 (채팅 흐름의 단일 결과든, 대시보드의 4분류든 그대로 재사용 가능).
     """
     js_key = load_app_settings().get("kakao_js_key")
     if not js_key:
@@ -20,25 +29,26 @@ def render_kakao_map(map_data: dict[str, Any]) -> None:
             "(REST API 키와는 별도의 키입니다.)"
         )
         return
-
-    center = map_data.get("center")
-    points = map_data.get("points") or []
     if not center:
+        return
+
+    categories = {key: group for key, group in categories.items() if group.get("points")}
+    if not categories:
         return
 
     st.session_state[_MAP_COUNTER_KEY] = st.session_state.get(_MAP_COUNTER_KEY, 0) + 1
     element_id = f"kakao-map-{st.session_state[_MAP_COUNTER_KEY]}"
 
     center_json = json.dumps(center, ensure_ascii=False)
-    points_json = json.dumps(points, ensure_ascii=False)
+    categories_json = json.dumps(categories, ensure_ascii=False)
 
     html = f"""
-    <div id="{element_id}" style="width:100%;height:480px;border-radius:8px;"></div>
+    <div id="{element_id}" style="width:100%;height:600px;border-radius:8px;"></div>
     <script src="https://dapi.kakao.com/v2/maps/sdk.js?appkey={js_key}&autoload=false"></script>
     <script>
     kakao.maps.load(function () {{
         var center = {center_json};
-        var points = {points_json};
+        var categories = {categories_json};
         var container = document.getElementById('{element_id}');
         var map = new kakao.maps.Map(container, {{
             center: new kakao.maps.LatLng(center.lat, center.lon),
@@ -46,9 +56,9 @@ def render_kakao_map(map_data: dict[str, Any]) -> None:
         }});
 
         var bounds = new kakao.maps.LatLngBounds();
-
         var centerPos = new kakao.maps.LatLng(center.lat, center.lon);
         bounds.extend(centerPos);
+
         var centerMarker = new kakao.maps.Marker({{
             position: centerPos,
             map: map,
@@ -62,42 +72,73 @@ def render_kakao_map(map_data: dict[str, Any]) -> None:
         }});
         centerInfo.open(map, centerMarker);
 
-        points.forEach(function (point) {{
-            var pos = new kakao.maps.LatLng(point.lat, point.lon);
-            bounds.extend(pos);
+        Object.keys(categories).forEach(function (key) {{
+            var group = categories[key];
+            var color = group.meta.color;
 
-            new kakao.maps.Marker({{ position: pos, map: map }});
+            group.points.forEach(function (point) {{
+                var pos = new kakao.maps.LatLng(point.lat, point.lon);
+                bounds.extend(pos);
 
-            var distanceLabel = point.distance_m
-                ? (point.distance_m >= 1000
+                var dot = document.createElement('div');
+                dot.style.width = '14px';
+                dot.style.height = '14px';
+                dot.style.borderRadius = '50%';
+                dot.style.background = color;
+                dot.style.border = '2px solid #fff';
+                dot.style.boxShadow = '0 0 3px rgba(0,0,0,0.5)';
+
+                new kakao.maps.CustomOverlay({{
+                    position: pos,
+                    content: dot,
+                    map: map,
+                }});
+
+                var distanceLabel = point.distance_m >= 1000
                     ? (point.distance_m / 1000).toFixed(1) + 'km'
-                    : point.distance_m + 'm')
-                : '';
-            var overlayContent = '<div style="padding:2px 6px;font-size:12px;background:#fff;' +
-                'border:1px solid #999;border-radius:4px;white-space:nowrap;">' +
-                point.name + (point.type ? ' (' + point.type + ')' : '') +
-                (distanceLabel ? ' · ' + distanceLabel : '') + '</div>';
-            new kakao.maps.CustomOverlay({{
-                position: pos,
-                content: overlayContent,
-                yAnchor: 2.2,
-                map: map,
-            }});
+                    : point.distance_m + 'm';
+                var labelContent = '<div style="padding:2px 6px;font-size:11px;background:#fff;' +
+                    'border:1px solid ' + color + ';border-radius:4px;white-space:nowrap;">' +
+                    point.name + ' · ' + distanceLabel + '</div>';
+                new kakao.maps.CustomOverlay({{
+                    position: pos,
+                    content: labelContent,
+                    yAnchor: 2.4,
+                    map: map,
+                }});
 
-            new kakao.maps.Polyline({{
-                path: [centerPos, pos],
-                strokeWeight: 2,
-                strokeColor: '#EA4335',
-                strokeOpacity: 0.8,
-                strokeStyle: 'shortdash',
-                map: map,
+                new kakao.maps.Polyline({{
+                    path: [centerPos, pos],
+                    strokeWeight: 2,
+                    strokeColor: color,
+                    strokeOpacity: 0.6,
+                    strokeStyle: 'shortdash',
+                    map: map,
+                }});
             }});
         }});
 
-        if (points.length > 0) {{
-            map.setBounds(bounds);
-        }}
+        map.setBounds(bounds);
+
+        var legend = document.createElement('div');
+        legend.style.position = 'absolute';
+        legend.style.top = '10px';
+        legend.style.left = '10px';
+        legend.style.background = 'rgba(255,255,255,0.9)';
+        legend.style.border = '1px solid #ccc';
+        legend.style.borderRadius = '6px';
+        legend.style.padding = '8px 10px';
+        legend.style.fontSize = '12px';
+        legend.style.zIndex = '10';
+        legend.innerHTML = Object.keys(categories).map(function (key) {{
+            var meta = categories[key].meta;
+            return '<div style="display:flex;align-items:center;gap:6px;margin:2px 0;">' +
+                '<span style="width:10px;height:10px;border-radius:50%;background:' + meta.color + ';display:inline-block;"></span>' +
+                '<span>' + meta.icon + ' ' + meta.label + '</span></div>';
+        }}).join('');
+        container.style.position = 'relative';
+        container.appendChild(legend);
     }});
     </script>
     """
-    st.components.v1.html(html, height=500)
+    st.components.v1.html(html, height=620)
