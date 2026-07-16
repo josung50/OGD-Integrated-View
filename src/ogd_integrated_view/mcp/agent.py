@@ -14,13 +14,32 @@ from ogd_integrated_view.mcp.region_lookup import find_region_code, find_region_
 MODEL = "claude-sonnet-5"
 MAX_TOOL_ROUNDS = 6
 _VALID_DONG_SUFFIX = re.compile(r"(동|읍|면|리)$")
+_YM_RANGE_RE = re.compile(r"(\d{4})년도?\s*(\d{1,2})월\s*(?:부터|~|-|,)\s*(?:(\d{4})년도?\s*)?(\d{1,2})월")
+_YM_SINGLE_RE = re.compile(r"(\d{4})년도?\s*(\d{1,2})월")
 
 
 def _log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [agent] {msg}", flush=True)
 
 
-def _sanitize_arguments(arguments: dict[str, Any], question: str) -> dict[str, Any]:
+def _parse_year_month_range(text: str) -> tuple[str, str] | None:
+    """'2026년 1월부터 6월까지' 또는 '2026년 1월' 같은 표현에서 YYYYMM 시작/끝을 뽑는다."""
+    range_match = _YM_RANGE_RE.search(text)
+    if range_match:
+        start_year, start_month, end_year, end_month = range_match.groups()
+        end_year = end_year or start_year
+        return f"{start_year}{int(start_month):02d}", f"{end_year}{int(end_month):02d}"
+
+    single_match = _YM_SINGLE_RE.search(text)
+    if single_match:
+        year, month = single_match.groups()
+        ym = f"{year}{int(month):02d}"
+        return ym, ym
+
+    return None
+
+
+def _sanitize_arguments(tool_name: str, arguments: dict[str, Any], question: str) -> dict[str, Any]:
     """dong 파라미터가 실제 읍/면/동 이름 형태가 아니면 통째로 지운다.
 
     sido_cd/sgg_cd처럼 지역 코드를 직접 요구하는 tool은 질문에서 지역명을 찾아
@@ -45,6 +64,28 @@ def _sanitize_arguments(arguments: dict[str, Any], question: str) -> dict[str, A
         region_name = find_region_name(question)
         if region_name:
             args["region_name"] = region_name
+
+    if tool_name == "get_nearby_apartment_transactions" or "start_year_month" in args or "end_year_month" in args:
+        period = _parse_year_month_range(question)
+        if period:
+            # 모델이 optional 파라미터 자체를 빠뜨리는 경우가 있어, 이 tool이면 질문에
+            # 기간이 있는 한 키가 원래 있었는지 여부와 상관없이 강제로 채운다.
+            start_ym, end_ym = period
+            args["start_year_month"] = start_ym
+            args["end_year_month"] = end_ym
+
+    if "months" in args:
+        try:
+            months_val = int(args["months"])
+        except (TypeError, ValueError):
+            del args["months"]
+        else:
+            # 작은 모델이 '202601'(YYYYMM) 같은 값을 개월 수 자리에 잘못 넣는 경우가 있어,
+            # 상식적인 개월 수 범위를 벗어나면 지워서 tool의 기본값을 쓰게 한다.
+            if 1 <= months_val <= 60:
+                args["months"] = months_val
+            else:
+                del args["months"]
 
     return args
 
@@ -239,7 +280,7 @@ async def ask(server: McpServerDefinition, question: str, api_key: str) -> dict[
 
                 tool_results = []
                 for tool_use in tool_uses:
-                    arguments = _sanitize_arguments(dict(tool_use.input), question)
+                    arguments = _sanitize_arguments(tool_use.name, dict(tool_use.input), question)
                     call_key = (tool_use.name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
                     if call_key in seen_calls:
                         _log(f"round {round_no}: duplicate tool call detected, skipping re-execution")
