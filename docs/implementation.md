@@ -36,7 +36,7 @@ CLI 배치 수집 (main.py)
 | `mcp/client.py` | MCP stdio 클라이언트 공통 로직 (`call_tool`), `months_ago()` 유틸 |
 | `mcp/agent.py` | 클라우드(Claude) 기반 tool-use 에이전트 — MCP tool 목록을 Claude에게 주고 자동 호출 |
 | `mcp/local_agent.py` | 로컬(Ollama) 기반 tool-use 에이전트 — 위와 동일한 역할을 로컬 모델로 수행 |
-| `mcp/region_lookup.py` | 텍스트에서 시/군/구 이름 → 법정동코드(LAWD_CD) 매핑 (`mcp/data/lawd_codes.json`) |
+| `mcp/region_lookup.py` | 텍스트에서 시/군/구 이름 → 법정동코드(LAWD_CD) 매핑 (`mcp/data/lawd_codes.json`). 토큰 단위 정확 일치만 본다 — 예전엔 부분열 포함 검사라 "강남구"가 "경상북도 포항시 남구"로 잘못 매칭되는 버그가 있었다("남구"가 "강남구"의 부분열) |
 | `mcp/building_lookup.py` | 카카오 로컬 API로 도로명주소 ↔ 건물명 변환 |
 | `mcp/commercial_district.py` | 소상공인시장진흥공단 상가(상권)정보 API — 좌표+반경으로 상가업소 목록/개수 조회, 업종별 집계. `location_pipeline.py:analyze_all()`이 호출해 입지분석 결과의 "상권" 팝오버(업종별 개수 표)로 연동됨 |
 | `mcp/location_pipeline.py` | `analyze_all()` — 입지분석 탭의 "주소 검색" 폼이 쓰는 고정 파이프라인 (LLM에게 맡기지 않고 4가지 조회를 순서대로 실행) |
@@ -137,6 +137,18 @@ CLI 배치 수집 (main.py)
 | `evaluate_life_quality(같은 파라미터)` | 삶의질 점수 — 환경 25% + 편의성 25% + 안전 20% + 교육 15% + 문화 15% |
 | `recommend_property(..., user_preference)` | 위 점수들을 종합한 매물 추천 |
 | `get_region_codes()` | 법정동코드 조회 |
+
+> ⚠️ **`get_nearby_apartment_transactions`(및 내부 `_get_real_estate_data`)는 원래 rt.molit.go.kr을
+> 브라우저처럼 흉내내 CSV를 받아오는 방식이 기본값이었는데, 강남구/강서구 외 지역은 지역명이
+> `"서울특별시"/"기타"`로 잘못 하드코딩되어 있어 항상 0건이 나왔다.** 지금은 공식
+> `apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev`(MOLIT_API_KEY 사용)
+> XML API가 기본값이고, 아파트 유형만 지원한다(오피스텔/연립다세대는 서비스 그룹 번호 미확인).
+> XML이 주는 영문 태그는 `_normalize_xml_apt_item()`이 기존 CSV 파서와 같은 한글 키로 변환하는데,
+> 이때 도로명에 건물본번(`roadNmBonbun`)까지 꼭 붙여야 네이버 지오코딩이 성공한다(거리 이름만으론
+> 지점을 특정 못 함). 또한 거래량이 많은 지역은 지오코딩 호출 상한(`max_geocode=40`) 때문에
+> 분석 대상 건물의 거래가 상한 밖으로 밀릴 수 있어, 대상 주소와 같은 도로명+번지인 거래를
+> 최우선으로 정렬해 확실히 포함시킨다. 이 수정들은 벤더 리포지토리(`vendor/A2A-MCP-RealEstate`,
+> 별도 git 저장소, `.gitignore`로 제외됨) 쪽 코드라 커밋 여부는 그 저장소에서 별도로 판단해야 한다.
 | `get_usage_guide()` | 서버 자체 사용 가이드 텍스트 |
 
 > ⚠️ 이 스코어링 함수들은 **고정된 규칙 기반**(하드코딩된 임계값·가중치)이며 실시간 시세 예측 모델이 아니다.
