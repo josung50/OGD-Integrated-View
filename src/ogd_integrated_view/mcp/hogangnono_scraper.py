@@ -11,6 +11,12 @@ class HogangnonoSessionExpired(Exception):
     경우가 있어, 그런 경우까지 세션 만료로 오판해 캐시된 쿠키를 지우면 안 된다.)"""
 
 
+class HogangnonoNoReviewData(Exception):
+    """해당 카테고리에 리뷰가 없어 호갱노노가 "페이지가 존재하지 않습니다" 안내
+    페이지로 보낸 경우. 세션 만료나 일시적 오류가 아니라 그냥 데이터가 없는
+    것이므로, 사용자에게 다르게(오류가 아니라 데이터 없음으로) 안내해야 한다."""
+
+
 HOMEPAGE_URL = "https://hogangnono.com/"
 AI_SUMMARY_SELECTOR = "#review-ai-summary-page-scroll"
 PAGE_LOAD_TIMEOUT_MS = 30_000
@@ -266,6 +272,8 @@ async def fetch_ai_summary(apt_url: str, cookie_header: str, category: str | Non
                 print(f"[hogangnono_scraper] 최종 URL: {page.url}, 제목: {await page.title()}", flush=True)
                 if "/auth" in page.url:
                     raise HogangnonoSessionExpired(f"세션이 만료되어 로그인 페이지로 리다이렉트됨: {page.url}") from exc
+                if await page.locator("text=페이지가 존재하지 않습니다").count() > 0:
+                    raise HogangnonoNoReviewData(f"'{category}' 카테고리에 리뷰 데이터가 없음") from exc
                 debug_path = "data/sources/_debug_ai_summary.png"
                 await page.screenshot(path=debug_path)
                 print(f"[hogangnono_scraper] 스크린샷 저장: {debug_path}", flush=True)

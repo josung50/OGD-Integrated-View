@@ -8,6 +8,7 @@ from ogd_integrated_view.dashboard.kakao_map import CATEGORY_META, render_kakao_
 from ogd_integrated_view.dashboard.backend import query_location_analysis
 from ogd_integrated_view.mcp.hogangnono_scraper import (
     AI_SUMMARY_CATEGORIES,
+    HogangnonoNoReviewData,
     HogangnonoSessionExpired,
     capture_login_session,
     fetch_ai_summary,
@@ -187,11 +188,14 @@ def _extract_summary_paragraph(raw_text: str) -> str | None:
 _MAX_CONCURRENT_SUMMARY_FETCHES = 4
 
 
-async def _fetch_all_category_summaries(apt_url: str, cookie: str) -> list[tuple[str, str]]:
+async def _fetch_all_category_summaries(apt_url: str, cookie: str) -> tuple[list[tuple[str, str]], bool]:
     """9개 카테고리를 동시에 다 쏘면 헤드리스 브라우저 9개가 한꺼번에 뜨면서 리소스
     경합으로 개별 요청이 타임아웃나기 쉬워서, 동시 실행 개수를 제한한다. 그리고
     session이 실제로 만료된 경우(HogangnonoSessionExpired)와 단순 타임아웃 같은
-    일시적 실패를 구분해서, 후자는 그 카테고리만 건너뛰고 나머지는 정상 반환한다."""
+    일시적 실패를 구분해서, 후자는 그 카테고리만 건너뛰고 나머지는 정상 반환한다.
+
+    반환값의 두 번째 항목은 "9개 전부 리뷰 데이터 자체가 없었는지" 여부다 —
+    소규모 단지처럼 애초에 리뷰가 없는 경우를 오류로 보이게 하지 않기 위해 구분한다."""
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SUMMARY_FETCHES)
 
     async def _fetch_one(category: str):
@@ -207,13 +211,19 @@ async def _fetch_all_category_summaries(apt_url: str, cookie: str) -> list[tuple
             raise result
 
     summaries = []
+    no_data_count = 0
     for category, raw_text in zip(AI_SUMMARY_CATEGORIES, raw_results):
+        if isinstance(raw_text, HogangnonoNoReviewData):
+            no_data_count += 1
+            continue
         if isinstance(raw_text, BaseException):
             continue
         paragraph = _extract_summary_paragraph(raw_text) if raw_text else None
         if paragraph:
             summaries.append((category, paragraph))
-    return summaries
+
+    all_no_data = no_data_count == len(AI_SUMMARY_CATEGORIES)
+    return summaries, all_no_data
 
 
 def _fetch_resident_opinions(apartment_query: str) -> dict:
@@ -235,7 +245,7 @@ def _fetch_resident_opinions(apartment_query: str) -> dict:
         return {"answer": f"호갱노노에서 '{apartment_query}'를 찾지 못했습니다.", "map": None}
 
     try:
-        summaries = asyncio.run(_fetch_all_category_summaries(apt_url, cookie))
+        summaries, all_no_data = asyncio.run(_fetch_all_category_summaries(apt_url, cookie))
     except HogangnonoSessionExpired:
         # 실제로 세션이 만료되어 /auth로 리다이렉트된 경우에만 캐시된 쿠키를 지운다
         st.session_state.pop(_HOGANGNONO_COOKIE_KEY, None)
@@ -244,6 +254,12 @@ def _fetch_resident_opinions(apartment_query: str) -> dict:
             "map": None,
         }
     if not summaries:
+        if all_no_data:
+            # 오류가 아니라 애초에 리뷰가 적은(소규모 단지 등) 경우이니 오류처럼 보이면 안 된다
+            return {
+                "answer": f"'{apartment_query}'는 호갱노노에 등록된 실거주자 리뷰 데이터가 없습니다.",
+                "map": None,
+            }
         # 세션은 멀쩡한데 일시적으로 전부 실패한 경우이니 쿠키는 그대로 유지한다
         return {
             "answer": "실거주자 의견 요약을 가져오지 못했습니다 (일시적인 오류일 수 있어요 — 다시 질문해보세요).",
