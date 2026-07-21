@@ -4,6 +4,13 @@ import time
 
 from playwright.async_api import async_playwright
 
+class HogangnonoSessionExpired(Exception):
+    """쿠키가 실제로 무효화되어 /auth로 리다이렉트된 경우에만 발생시킨다.
+    (단순 페이지 타임아웃 등 세션과 무관한 실패와 구분하기 위함 — 9개 카테고리를
+    병렬로 조회하다 보면 세션은 멀쩡한데 리소스 경합으로 개별 요청이 타임아웃나는
+    경우가 있어, 그런 경우까지 세션 만료로 오판해 캐시된 쿠키를 지우면 안 된다.)"""
+
+
 HOMEPAGE_URL = "https://hogangnono.com/"
 AI_SUMMARY_SELECTOR = "#review-ai-summary-page-scroll"
 PAGE_LOAD_TIMEOUT_MS = 30_000
@@ -257,6 +264,8 @@ async def fetch_ai_summary(apt_url: str, cookie_header: str, category: str | Non
             except Exception as exc:
                 print(f"[hogangnono_scraper] 요약 텍스트를 못 가져왔습니다: {exc}", flush=True)
                 print(f"[hogangnono_scraper] 최종 URL: {page.url}, 제목: {await page.title()}", flush=True)
+                if "/auth" in page.url:
+                    raise HogangnonoSessionExpired(f"세션이 만료되어 로그인 페이지로 리다이렉트됨: {page.url}") from exc
                 debug_path = "data/sources/_debug_ai_summary.png"
                 await page.screenshot(path=debug_path)
                 print(f"[hogangnono_scraper] 스크린샷 저장: {debug_path}", flush=True)

@@ -8,6 +8,7 @@ from ogd_integrated_view.dashboard.kakao_map import CATEGORY_META, render_kakao_
 from ogd_integrated_view.dashboard.backend import query_location_analysis
 from ogd_integrated_view.mcp.hogangnono_scraper import (
     AI_SUMMARY_CATEGORIES,
+    HogangnonoSessionExpired,
     capture_login_session,
     fetch_ai_summary,
     find_apartment_url,
@@ -183,12 +184,32 @@ def _extract_summary_paragraph(raw_text: str) -> str | None:
     return paragraph or None
 
 
+_MAX_CONCURRENT_SUMMARY_FETCHES = 4
+
+
 async def _fetch_all_category_summaries(apt_url: str, cookie: str) -> list[tuple[str, str]]:
+    """9개 카테고리를 동시에 다 쏘면 헤드리스 브라우저 9개가 한꺼번에 뜨면서 리소스
+    경합으로 개별 요청이 타임아웃나기 쉬워서, 동시 실행 개수를 제한한다. 그리고
+    session이 실제로 만료된 경우(HogangnonoSessionExpired)와 단순 타임아웃 같은
+    일시적 실패를 구분해서, 후자는 그 카테고리만 건너뛰고 나머지는 정상 반환한다."""
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SUMMARY_FETCHES)
+
+    async def _fetch_one(category: str):
+        async with semaphore:
+            return await fetch_ai_summary(apt_url, cookie, category=category)
+
     raw_results = await asyncio.gather(
-        *(fetch_ai_summary(apt_url, cookie, category=category) for category in AI_SUMMARY_CATEGORIES)
+        *(_fetch_one(category) for category in AI_SUMMARY_CATEGORIES), return_exceptions=True
     )
+
+    for result in raw_results:
+        if isinstance(result, HogangnonoSessionExpired):
+            raise result
+
     summaries = []
     for category, raw_text in zip(AI_SUMMARY_CATEGORIES, raw_results):
+        if isinstance(raw_text, BaseException):
+            continue
         paragraph = _extract_summary_paragraph(raw_text) if raw_text else None
         if paragraph:
             summaries.append((category, paragraph))
@@ -213,12 +234,19 @@ def _fetch_resident_opinions(apartment_query: str) -> dict:
     if not apt_url:
         return {"answer": f"호갱노노에서 '{apartment_query}'를 찾지 못했습니다.", "map": None}
 
-    summaries = asyncio.run(_fetch_all_category_summaries(apt_url, cookie))
-    if not summaries:
-        # 세션이 만료되었을 수도 있으니 한 번은 다시 로그인해서 재시도한다
+    try:
+        summaries = asyncio.run(_fetch_all_category_summaries(apt_url, cookie))
+    except HogangnonoSessionExpired:
+        # 실제로 세션이 만료되어 /auth로 리다이렉트된 경우에만 캐시된 쿠키를 지운다
         st.session_state.pop(_HOGANGNONO_COOKIE_KEY, None)
         return {
-            "answer": "실거주자 의견 요약을 가져오지 못했습니다 (세션이 만료되었을 수 있어요 — 다시 질문해보세요).",
+            "answer": "호갱노노 로그인 세션이 만료되었습니다 (다시 질문해보세요 — 로그인 창이 다시 뜹니다).",
+            "map": None,
+        }
+    if not summaries:
+        # 세션은 멀쩡한데 일시적으로 전부 실패한 경우이니 쿠키는 그대로 유지한다
+        return {
+            "answer": "실거주자 의견 요약을 가져오지 못했습니다 (일시적인 오류일 수 있어요 — 다시 질문해보세요).",
             "map": None,
         }
     answer = "\n\n".join(f"**{category}**\n{paragraph}" for category, paragraph in summaries)
