@@ -37,7 +37,11 @@ def render_chat_tab(
 
     user_input = st.chat_input(placeholder, key=f"{session_key}_input")
     if user_input:
-        _ask(history, query_fn, user_input)
+        # 타이핑한 내용이 example 문구와 정확히 같으면, 버튼을 눌렀을 때와 같은
+        # override 핸들러로 보낸다 (버튼은 대화 기록이 있으면 안 보이니, 같은
+        # 질문을 다시 타이핑했을 때도 동일하게 동작해야 한다).
+        handler = (example_overrides or {}).get(user_input, query_fn)
+        _ask(history, handler, user_input)
         asked = True
 
     # 새로 물어본 직후에는 화면을 한 번 더 그려서, 방금 추가된 메시지가 아래 목록에
