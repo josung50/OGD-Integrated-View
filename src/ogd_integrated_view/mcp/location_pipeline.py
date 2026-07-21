@@ -7,6 +7,7 @@ from mcp.client.stdio import stdio_client
 from ogd_integrated_view.mcp.base import McpServerDefinition
 from ogd_integrated_view.mcp.building_lookup import find_building_name, resolve_address
 from ogd_integrated_view.mcp.client import build_stdio_params
+from ogd_integrated_view.mcp.commercial_district import fetch_nearby_stores, summarize_by_category
 from ogd_integrated_view.mcp.region_lookup import find_region_code, find_region_name
 
 CONVENIENCE_CATEGORIES = ["편의점", "카페", "은행", "약국"]
@@ -178,7 +179,19 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
 
     _fill_transaction_building_names(categories["transactions"])
 
-    return {"center": center, "categories": categories, "errors": errors}
+    commercial = None
+    if center:
+        try:
+            store_result = fetch_nearby_stores(center["lat"], center["lon"], radius_m)
+            commercial = {
+                "total_count": store_result["total_count"],
+                "sampled_count": len(store_result["stores"]),
+                "by_category": summarize_by_category(store_result["stores"]),
+            }
+        except Exception as exc:
+            errors["commercial"] = f"상권 정보 조회에 실패했습니다: {exc}"
+
+    return {"center": center, "categories": categories, "errors": errors, "commercial": commercial}
 
 
 def _fill_transaction_building_names(transactions: list[dict[str, Any]]) -> None:

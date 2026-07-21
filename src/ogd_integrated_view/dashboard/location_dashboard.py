@@ -139,6 +139,27 @@ def render_location_dashboard() -> None:
                             "label": selected["name"],
                         }
 
+        # 상권은 반경 내 상가가 수천~수만 건까지 나올 수 있어(예: 강남역 500m 반경 6천여 건),
+        # 다른 카테고리처럼 개별 지점을 지도에 찍지 않고 업종별 개수만 표로 보여준다.
+        commercial = result.get("commercial")
+        commercial_error = result.get("errors", {}).get("commercial")
+        total_count = commercial["total_count"] if commercial else 0
+        with st.popover(f"🏬 상권 ({total_count:,}건)", use_container_width=True):
+            if commercial_error and not commercial:
+                st.caption(commercial_error)
+            elif not commercial or not commercial["by_category"]:
+                st.caption("반경 내 상권 정보를 찾지 못했습니다.")
+            else:
+                if commercial["sampled_count"] < commercial["total_count"]:
+                    st.caption(
+                        f"전체 {commercial['total_count']:,}건 중 가까운 {commercial['sampled_count']:,}건 "
+                        "표본 기준 업종 구성입니다."
+                    )
+                df = pd.DataFrame(
+                    [{"업종": row["category"], "개수": row["count"]} for row in commercial["by_category"]]
+                )
+                st.dataframe(df, hide_index=True, use_container_width=True)
+
     st.session_state[_PREV_SELECTION_KEY] = current_selection
     if new_focus_point:
         st.session_state[_FOCUS_POINT_KEY] = new_focus_point

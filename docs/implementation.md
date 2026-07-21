@@ -38,6 +38,7 @@ CLI 배치 수집 (main.py)
 | `mcp/local_agent.py` | 로컬(Ollama) 기반 tool-use 에이전트 — 위와 동일한 역할을 로컬 모델로 수행 |
 | `mcp/region_lookup.py` | 텍스트에서 시/군/구 이름 → 법정동코드(LAWD_CD) 매핑 (`mcp/data/lawd_codes.json`) |
 | `mcp/building_lookup.py` | 카카오 로컬 API로 도로명주소 ↔ 건물명 변환 |
+| `mcp/commercial_district.py` | 소상공인시장진흥공단 상가(상권)정보 API — 좌표+반경으로 상가업소 목록/개수 조회, 업종별 집계. `location_pipeline.py:analyze_all()`이 호출해 입지분석 결과의 "상권" 팝오버(업종별 개수 표)로 연동됨 |
 | `mcp/location_pipeline.py` | `analyze_all()` — 입지분석 탭의 "주소 검색" 폼이 쓰는 고정 파이프라인 (LLM에게 맡기지 않고 4가지 조회를 순서대로 실행) |
 | `mcp/hogangnono_scraper.py` | 호갱노노 로그인/검색/AI요약 Playwright 스크래퍼 (MCP 서버 아님, 순수 파이썬 모듈) |
 | `mcp/crosswalk_check.py` | 횡단보도 데이터 로드 + 두 지점 사이 횡단보도 유무 판정 |
@@ -62,8 +63,12 @@ CLI 배치 수집 (main.py)
   - `find_nearby_facilities` tool을 카테고리별로 반복 호출 → 편의점/카페/은행/약국(`convenience`), 대학병원/대형마트(`infra`), 학교(`schools`)
   - `get_nearby_apartment_transactions` tool 1회 → 반경 내 아파트 실거래(최근 1년)
   - 각 카테고리 최대 15건으로 트리밍, 거래 항목은 도로명 대신 실제 건물명으로 보강(`find_building_name`)
-- 결과는 5개 카테고리(`subway`/`convenience`/`infra`/`schools`/`transactions`)로 나뉘어 팝오버 표 + 카카오맵 마커로 표시
-- 표에서 행을 클릭하면 지도가 해당 지점으로 포커스 이동 (`_FOCUS_POINT_KEY`)
+  - `commercial_district.py:fetch_nearby_stores()` 1회(공공데이터포털, MCP tool 아님) → 반경 내 상가 총 개수 + 업종별 집계
+- 지도에 마커로 찍는 5개 카테고리(`subway`/`convenience`/`infra`/`schools`/`transactions`)는 팝오버 표 + 카카오맵 마커로 표시,
+  표에서 행을 클릭하면 지도가 해당 지점으로 포커스 이동 (`_FOCUS_POINT_KEY`)
+- **상권**은 반경 내 상가가 수천~수만 건까지 나올 수 있어(강남역 1km 반경 16,756건) 개별 지점을 지도에 찍지 않고,
+  별도 팝오버("🏬 상권 (N건)")에 업종별 개수 표만 보여준다. `total_count`(전체 개수)가 실제 총합이고,
+  업종 구성은 API가 한 번에 주는 최대 1000건(가까운 순) 표본 기준이라 표본 수 < 전체 개수일 때 안내 문구를 붙인다.
 
 ### 3-2. 자유 질의 챗 (일반 LLM 경로)
 
@@ -104,6 +109,7 @@ CLI 배치 수집 (main.py)
 | API | 용도 | 키 이름 | 호출 위치 |
 |---|---|---|---|
 | 공공데이터포털 — 전국횡단보도표준데이터 | 도보 경로상 횡단보도 유무 판정용 원본 데이터 | `PUBLIC_DATA_API_KEY` | `apis/definitions/crosswalk.py` |
+| 공공데이터포털 — 소상공인시장진흥공단 상가(상권)정보 | 반경 내 상가업소 목록/개수 조회 (상권 발달 정도 판단용) | `PUBLIC_DATA_API_KEY` (동일 키, 별도 활용신청 필요) | `mcp/commercial_district.py` |
 | 공공데이터포털 — 국토교통부(MOLIT) 실거래가 | 아파트 실거래가 조회 | `MOLIT_API_KEY` (A2A-MCP-RealEstate 서버 env) | vendor MCP 서버 내부 |
 | 카카오 로컬 API (주소/키워드 검색) | 건물명 조회, 단지명→도로명주소 정규화, 지역 검색(A2A 서버) | `KAKAO_API_KEY` (REST) | `mcp/building_lookup.py`, A2A 서버 |
 | 카카오맵 JavaScript SDK | 대시보드 지도 렌더링 | `KAKAO_JS_KEY` (JS, REST키와 별도) | `dashboard/kakao_map.py` |
