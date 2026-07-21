@@ -3,12 +3,15 @@ from pathlib import Path
 
 import streamlit as st
 
+from ogd_integrated_view.collectors.collector import refresh_api
+from ogd_integrated_view.mcp.crosswalk_check import load_crosswalks
 from ogd_integrated_view.mcp.config_store import (
     load_app_settings,
     load_servers,
     save_app_settings,
     save_servers,
 )
+from ogd_integrated_view.storage.repository import Repository
 
 ROLE_LABELS = {
     "location_analysis": "📍 부동산 입지분석",
@@ -150,6 +153,32 @@ def render_settings_tab() -> None:
             save_servers(servers)
             st.success("부동산 입지분석 MCP 서버가 저장되었습니다.")
             st.rerun()
+
+    st.divider()
+
+    st.subheader("공공데이터 — 전국횡단보도표준데이터")
+    st.caption(
+        "학교 등 목적지까지 횡단보도를 건너지 않고 갈 수 있는지 판정하는 데 쓰이는 데이터입니다. "
+        "data.go.kr에서 전국 데이터를 새로 받아와 로컬 저장소를 최신 스냅샷으로 통째로 교체합니다 "
+        "(반기 갱신 데이터라 자주 누를 필요는 없습니다). 페이지당 1,000건씩 순차 조회하며, "
+        "전국 약 6만 건이라 완료까지 몇 분 걸릴 수 있습니다."
+    )
+    crosswalk_df = load_crosswalks()
+    if crosswalk_df.empty:
+        st.caption("아직 수집된 데이터가 없습니다.")
+    else:
+        last_collected = crosswalk_df["collected_at"].max() if "collected_at" in crosswalk_df else "알 수 없음"
+        st.caption(f"현재 저장된 데이터: {len(crosswalk_df):,}건 (마지막 수집: {last_collected})")
+    if st.button("횡단보도 데이터 최신화", key="refresh_crosswalk"):
+        with st.spinner("전국 횡단보도 데이터를 새로 받아오는 중... (몇 분 걸릴 수 있습니다)"):
+            try:
+                count = refresh_api("crosswalk", Repository())
+            except Exception as exc:
+                st.error(f"수집 중 오류가 발생했습니다: {exc}")
+            else:
+                load_crosswalks(force_reload=True)
+                st.success(f"{count:,}건을 새로 저장했습니다.")
+                st.rerun()
 
     st.divider()
 

@@ -19,6 +19,7 @@ def render_chat_tab(
     placeholder: str,
     examples: list[str],
     query_fn: Callable[[str], dict[str, Any]],
+    example_overrides: dict[str, Callable[[str], dict[str, Any]]] | None = None,
 ) -> None:
     st.caption(description)
 
@@ -30,7 +31,8 @@ def render_chat_tab(
         st.write("이렇게 물어보세요:")
         for col, example in zip(st.columns(len(examples)), examples):
             if col.button(example, key=f"{session_key}_example_{example}"):
-                _ask(history, query_fn, example)
+                handler = (example_overrides or {}).get(example, query_fn)
+                _ask(history, handler, example)
                 asked = True
 
     user_input = st.chat_input(placeholder, key=f"{session_key}_input")

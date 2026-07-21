@@ -16,6 +16,7 @@ wheels/
 data/*.xlsx
 data/mcp_servers.json
 data/app_settings.json
+data/sources/
 
 # Vendored external MCP server repos (not our code)
 vendor/

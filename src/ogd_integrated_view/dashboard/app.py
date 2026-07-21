@@ -1,12 +1,15 @@
 import sys
 
 import streamlit as st
+from dotenv import load_dotenv
 
 from ogd_integrated_view.dashboard.location_dashboard import render_location_dashboard
 from ogd_integrated_view.dashboard.settings import render_settings_tab
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+load_dotenv()
 
 
 def main() -> None:

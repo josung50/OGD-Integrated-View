@@ -5,11 +5,13 @@ from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 
 from ogd_integrated_view.mcp.base import McpServerDefinition
+from ogd_integrated_view.mcp.building_lookup import find_building_name, resolve_address
 from ogd_integrated_view.mcp.client import build_stdio_params
 from ogd_integrated_view.mcp.region_lookup import find_region_code, find_region_name
 
 CONVENIENCE_CATEGORIES = ["편의점", "카페", "은행", "약국"]
 INFRA_CATEGORIES = ["대학병원", "대형마트"]
+SCHOOL_LEVELS = ["초등학교", "중학교", "고등학교"]
 MAX_POINTS_PER_CATEGORY = 15
 
 
@@ -35,6 +37,7 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
     LLM에게 어떤 tool을 부를지 맡기지 않고 항상 같은 4가지 조회를 고정 순서로 실행한다 —
     작은 로컬 모델이 tool 이름을 헷갈리거나 매 라운드마다 몇십 초씩 걸리는 문제를 피하기 위해서다.
     """
+    address = resolve_address(address)
     lawd_cd = find_region_code(address)
     region_name = find_region_name(address)
     radius_m = int(radius_km * 1000)
@@ -44,6 +47,7 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
         "subway": [],
         "convenience": [],
         "infra": [],
+        "schools": [],
         "transactions": [],
     }
     center: dict[str, Any] | None = None
@@ -59,7 +63,18 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
                 data = loc_data["data"]
                 coords = data.get("coordinates", {})
                 if "lat" in coords and "lon" in coords:
-                    center = {"lat": coords["lat"], "lon": coords["lon"], "label": address}
+                    try:
+                        building_name = find_building_name(address)
+                    except Exception:
+                        building_name = None
+                    label = f"{address} ({building_name})" if building_name else address
+                    center = {
+                        "lat": coords["lat"],
+                        "lon": coords["lon"],
+                        "label": label,
+                        "address": address,
+                        "building_name": building_name,
+                    }
                 for station in data.get("nearest_stations", []):
                     if station.get("distance_km", 999) <= radius_km and "lat" in station:
                         categories["subway"].append(
@@ -99,6 +114,32 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
                     elif not fac_data or not fac_data.get("success"):
                         errors.setdefault(cat_key, (fac_data or {}).get("message", "편의시설 조회에 실패했습니다"))
 
+            if center:
+                school_result = await session.call_tool(
+                    "find_nearby_facilities",
+                    {"address": address, "category": "학교", "radius": radius_m},
+                )
+                school_data = _tool_result_json(school_result)
+                if school_data and school_data.get("success"):
+                    for fac in school_data["data"].get("facilities", []):
+                        if "lat" not in fac or "lon" not in fac:
+                            continue
+                        category_name = fac.get("category", "")
+                        level = next((lvl for lvl in SCHOOL_LEVELS if lvl in category_name), None)
+                        if level is None:
+                            continue
+                        categories["schools"].append(
+                            {
+                                "name": fac.get("name", ""),
+                                "lat": fac["lat"],
+                                "lon": fac["lon"],
+                                "distance_m": fac.get("distance_m", 0),
+                                "detail": level,
+                            }
+                        )
+                else:
+                    errors.setdefault("schools", (school_data or {}).get("message", "학교 조회에 실패했습니다"))
+
             if center and lawd_cd and region_name:
                 tx_result = await session.call_tool(
                     "get_nearby_apartment_transactions",
@@ -117,10 +158,12 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
                             categories["transactions"].append(
                                 {
                                     "name": tx.get("name", ""),
+                                    "road_address": tx.get("road_address", ""),
                                     "lat": tx["lat"],
                                     "lon": tx["lon"],
                                     "distance_m": tx.get("distance_m", 0),
                                     "detail": tx.get("price", ""),
+                                    "area": tx.get("area", ""),
                                     "date": _format_deal_date(tx.get("deal_month", ""), tx.get("deal_day", "")),
                                 }
                             )
@@ -133,4 +176,28 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
         points.sort(key=lambda p: p.get("distance_m", 0))
         del points[MAX_POINTS_PER_CATEGORY:]
 
+    _fill_transaction_building_names(categories["transactions"])
+
     return {"center": center, "categories": categories, "errors": errors}
+
+
+def _fill_transaction_building_names(transactions: list[dict[str, Any]]) -> None:
+    """실거래 이름을 도로명 대신 아파트/오피스텔/빌라 등 실제 건물명으로 보강한다.
+
+    건물명을 찾지 못하면(단독주택 등) 기존 이름(도로명 폴백)을 그대로 둔다.
+    같은 반경 내 여러 거래가 같은 건물에서 나오는 경우가 많아 주소별로 캐시해서
+    중복 조회를 줄인다 (트리밍 이후에만 실행하므로 호출 수도 최대 15건으로 제한됨).
+    """
+    cache: dict[str, str | None] = {}
+    for point in transactions:
+        road_address = point.pop("road_address", "")
+        if not road_address:
+            continue
+        if road_address not in cache:
+            try:
+                cache[road_address] = find_building_name(road_address)
+            except Exception:
+                cache[road_address] = None
+        building_name = cache[road_address]
+        if building_name:
+            point["name"] = building_name

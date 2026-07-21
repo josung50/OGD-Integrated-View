@@ -11,6 +11,7 @@ CATEGORY_META: dict[str, dict[str, str]] = {
     "subway": {"label": "지하철역", "icon": "🚇", "color": "#4285F4"},
     "convenience": {"label": "편의시설", "icon": "🏪", "color": "#34A853"},
     "infra": {"label": "주요 인프라", "icon": "🏥", "color": "#EA4335"},
+    "schools": {"label": "학교", "icon": "🏫", "color": "#FBBC05"},
     "transactions": {"label": "아파트 실거래", "icon": "🏢", "color": "#A142F4"},
 }
 
