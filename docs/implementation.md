@@ -60,7 +60,7 @@ CLI 배치 수집 (main.py)
   - `resolve_address()`(카카오 키워드 검색)로 "은마아파트" 같은 단지명을 도로명주소로 정규화
   - `analyze_location` tool 1회 → 좌표 + 가까운 지하철역
   - `find_nearby_facilities` tool을 카테고리별로 반복 호출 → 편의점/카페/은행/약국(`convenience`), 대학병원/대형마트(`infra`), 학교(`schools`)
-  - `get_nearby_apartment_transactions` tool 1회 → 반경 내 아파트 실거래(3개월)
+  - `get_nearby_apartment_transactions` tool 1회 → 반경 내 아파트 실거래(최근 1년)
   - 각 카테고리 최대 15건으로 트리밍, 거래 항목은 도로명 대신 실제 건물명으로 보강(`find_building_name`)
 - 결과는 5개 카테고리(`subway`/`convenience`/`infra`/`schools`/`transactions`)로 나뉘어 팝오버 표 + 카카오맵 마커로 표시
 - 표에서 행을 클릭하면 지도가 해당 지점으로 포커스 이동 (`_FOCUS_POINT_KEY`)

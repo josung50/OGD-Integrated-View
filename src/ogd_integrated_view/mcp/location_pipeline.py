@@ -148,7 +148,7 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
                         "lawd_cd": lawd_cd,
                         "region_name": region_name,
                         "radius_km": radius_km,
-                        "months": 3,
+                        "months": 12,
                     },
                 )
                 tx_data = _tool_result_json(tx_result)
