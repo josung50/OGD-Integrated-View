@@ -1,3 +1,4 @@
+import asyncio
 import re
 import time
 
@@ -64,11 +65,14 @@ async def _close_intro_modal(page) -> None:
     data-ga-event="intro,closeBtn"는 화면을 실제로 막고 있는 모달과는 무관한
     숨은 요소를 가리킬 때가 있어 클릭이 "성공"해도 진짜 모달은 안 닫힐 수 있다.
     그래서 하나가 성공해도 멈추지 않고 두 선택자를 모두 시도한 뒤, 그래도 오버레이가
-    남아있으면 배경(다이얼로그 바깥 영역)을 직접 클릭해 닫는다."""
+    남아있으면 배경(다이얼로그 바깥 영역)을 직접 클릭해 닫는다. count()로 아예
+    없는 선택자는 클릭 타임아웃을 기다리지 않고 바로 건너뛴다."""
     for locator in (
         page.locator('button.text-primary-foreground:has-text("닫기")'),
         page.locator('[data-ga-event="intro,closeBtn"]'),
     ):
+        if await locator.count() == 0:
+            continue
         try:
             await locator.click(timeout=1200)
             await page.wait_for_timeout(200)
@@ -83,45 +87,47 @@ async def _close_intro_modal(page) -> None:
             pass
 
 
-async def _get_fresh_kakao_login_url() -> str:
+async def _get_fresh_kakao_login_url(p) -> str:
     """헤드리스 브라우저로 홈페이지에서 로그인 버튼을 눌러, 카카오가 방금 발급한
     유효한 로그인 URL(매번 새로운 auth_tran_id 포함)만 뽑아낸다. 사용자에게는
     호갱노노 홈페이지를 전혀 보여주지 않고, 이 URL로 바로 보이는 창을 띄우기 위함이다.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
-            context = await browser.new_context()
-            page = await context.new_page()
-            await page.goto(HOMEPAGE_URL, timeout=PAGE_LOAD_TIMEOUT_MS, wait_until="domcontentloaded")
+    playwright 드라이버 프로세스(p)는 호출자가 띄운 걸 그대로 받아써서 매번
+    새로 기동하는 ~1.5초를 아낀다."""
+    browser = await p.chromium.launch(headless=True)
+    try:
+        context = await browser.new_context()
+        page = await context.new_page()
+        # domcontentloaded까지 안 기다리고 응답이 오는 대로 바로 진행한다 (이후
+        # 클릭/대기는 전부 자체 타임아웃으로 요소 등장을 기다리므로 안전하다).
+        await page.goto(HOMEPAGE_URL, timeout=PAGE_LOAD_TIMEOUT_MS, wait_until="commit")
 
-            await _close_intro_modal(page)
+        await _close_intro_modal(page)
 
-            # 홍보 모달이 로그인 모달과 같은 슬롯을 써서, 게스트 로그인 클릭 직후에
-            # 타이머로 늦게 뜨는 홍보 모달이 방금 연 로그인 모달을 밀어내는 경우가 있다.
-            # 카카오 로그인 버튼이 나타날 때까지 (닫기 → 재클릭)을 몇 번 재시도한다.
-            kakao_login_btn = page.locator('[data-ga-event="auth,loginKakao"]')
-            for _ in range(4):
-                # 채팅/광고 위젯 등 작은 고정 UI가 여전히 살짝 겹치는 경우가 있어 강제로 클릭한다
-                await page.get_by_test_id("guest-login-button").click(timeout=10_000, force=True)
-                try:
-                    await kakao_login_btn.wait_for(state="visible", timeout=1200)
-                    break
-                except Exception:
-                    await _close_intro_modal(page)
-            else:
-                raise RuntimeError("카카오 로그인 버튼을 찾지 못했습니다 (홍보 모달에 계속 가로막힘).")
+        # 홍보 모달이 로그인 모달과 같은 슬롯을 써서, 게스트 로그인 클릭 직후에
+        # 타이머로 늦게 뜨는 홍보 모달이 방금 연 로그인 모달을 밀어내는 경우가 있다.
+        # 카카오 로그인 버튼이 나타날 때까지 (닫기 → 재클릭)을 몇 번 재시도한다.
+        kakao_login_btn = page.locator('[data-ga-event="auth,loginKakao"]')
+        for _ in range(4):
+            # 채팅/광고 위젯 등 작은 고정 UI가 여전히 살짝 겹치는 경우가 있어 강제로 클릭한다
+            await page.get_by_test_id("guest-login-button").click(timeout=10_000, force=True)
+            try:
+                await kakao_login_btn.wait_for(state="visible", timeout=1200)
+                break
+            except Exception:
+                await _close_intro_modal(page)
+        else:
+            raise RuntimeError("카카오 로그인 버튼을 찾지 못했습니다 (홍보 모달에 계속 가로막힘).")
 
-            # "카카오 계정으로 로그인"은 같은 페이지에서 이동하지 않고 새 팝업 창을 연다.
-            async with context.expect_page(timeout=10_000) as popup_info:
-                await kakao_login_btn.click(timeout=5000, force=True)
-            popup = await popup_info.value
-            await popup.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
-            if "kakao.com" not in popup.url:
-                raise RuntimeError("카카오 로그인 URL을 새로 발급받지 못했습니다.")
-            return popup.url
-        finally:
-            await browser.close()
+        # "카카오 계정으로 로그인"은 같은 페이지에서 이동하지 않고 새 팝업 창을 연다.
+        async with context.expect_page(timeout=10_000) as popup_info:
+            await kakao_login_btn.click(timeout=5000, force=True)
+        popup = await popup_info.value
+        await popup.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
+        if "kakao.com" not in popup.url:
+            raise RuntimeError("카카오 로그인 URL을 새로 발급받지 못했습니다.")
+        return popup.url
+    finally:
+        await browser.close()
 
 
 async def capture_login_session(timeout_s: int = LOGIN_TIMEOUT_S) -> str:
@@ -138,10 +144,20 @@ async def capture_login_session(timeout_s: int = LOGIN_TIMEOUT_S) -> str:
     로그인 없이 즉시 에러 리다이렉트가 오는데, 이를 정상 로그인 완료로 착각하지
     않기 위해서다).
     """
-    start_url = await _get_fresh_kakao_login_url()
-
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        # 사용자에게 보일 브라우저 창의 launch(약 1초)를, 헤드리스로 로그인 URL을
+        # 받아오는 동안 미리 동시에 진행해서 체감 대기시간을 줄인다.
+        headed_browser_task = asyncio.ensure_future(p.chromium.launch(headless=False))
+        try:
+            start_url = await _get_fresh_kakao_login_url(p)
+        except Exception:
+            try:
+                await (await headed_browser_task).close()
+            except Exception:
+                pass
+            raise
+
+        browser = await headed_browser_task
         try:
             context = await browser.new_context()
             page = await context.new_page()
