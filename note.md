@@ -1,0 +1,1 @@
+uv run streamlit run src/ogd_integrated_view/dashboard/app.py

@@ -47,19 +47,41 @@ def render_settings_tab() -> None:
     )
     app_settings = load_app_settings()
 
-    st.markdown("**로컬 LLM (Ollama, 무료)**")
+    st.markdown("**로컬 LLM (Ollama 또는 vLLM, 무료)**")
     st.caption(
         "Ollama가 로컬에서 실행 중이어야 합니다 (`ollama serve`). "
         "tool calling을 지원하는 모델만 사용 가능합니다 (예: qwen3:1.7b — 테스트 완료, gemma3는 미지원)."
     )
+    local_backend = st.radio(
+        "로컬 LLM 백엔드",
+        options=["ollama", "vllm"],
+        index=0 if app_settings.get("local_backend", "ollama") == "ollama" else 1,
+        format_func=lambda v: "Ollama" if v == "ollama" else "vLLM (OpenAI 호환)",
+        key="local_backend_radio",
+        horizontal=True,
+    )
+    vllm_base_url = ""
+    if local_backend == "vllm":
+        st.caption(
+            "vLLM 서버가 tool calling을 지원하는 옵션으로 실행 중이어야 합니다 "
+            "(예: `--enable-auto-tool-choice --tool-call-parser <모델에 맞는 파서>`)."
+        )
+        vllm_base_url = st.text_input(
+            "vLLM Base URL",
+            value=app_settings.get("vllm_base_url", "http://localhost:8000/v1"),
+            key="vllm_base_url_input",
+        )
     local_model = st.text_input(
         "로컬 모델명",
         value=app_settings.get("local_model", ""),
-        placeholder="예: qwen3:1.7b",
+        placeholder="예: qwen3:1.7b (Ollama) 또는 Qwen3.6 (vLLM에 등록된 served-model-name)",
         key="local_model_input",
     )
     if st.button("로컬 LLM 설정 저장", key="save_local_model"):
         app_settings["local_model"] = local_model
+        app_settings["local_backend"] = local_backend
+        if local_backend == "vllm":
+            app_settings["vllm_base_url"] = vllm_base_url
         save_app_settings(app_settings)
         st.success("저장되었습니다." if local_model else "로컬 LLM이 비활성화되었습니다 (모델명이 비어있습니다).")
         st.rerun()

@@ -3,12 +3,12 @@ import re
 from datetime import date, datetime
 from typing import Any
 
-import ollama
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 
 from ogd_integrated_view.mcp.base import McpServerDefinition
 from ogd_integrated_view.mcp.client import build_stdio_params, months_ago
+from ogd_integrated_view.mcp.llm_backends import NormalizedToolCall, build_backend
 from ogd_integrated_view.mcp.region_lookup import find_region_code, find_region_name
 
 MAX_TOOL_ROUNDS = 6
@@ -91,7 +91,7 @@ def _sanitize_arguments(tool_name: str, arguments: dict[str, Any], question: str
     return args
 
 
-def _mcp_tool_to_ollama(tool: Any) -> dict[str, Any]:
+def _mcp_tool_to_tool_spec(tool: Any) -> dict[str, Any]:
     return {
         "type": "function",
         "function": {
@@ -232,15 +232,22 @@ def _extract_map_data(tool_name: str, result_text: str) -> tuple[dict[str, Any] 
     return center, points
 
 
-async def ask(server: McpServerDefinition, question: str, model: str) -> dict[str, Any]:
-    """연결된 MCP 서버의 tool 목록을 로컬 LLM(Ollama)에게 보여주고, 알아서 호출하게 한다."""
+async def ask(
+    server: McpServerDefinition,
+    question: str,
+    model: str,
+    backend: str = "ollama",
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """연결된 MCP 서버의 tool 목록을 로컬 LLM(Ollama 또는 vLLM)에게 보여주고, 알아서 호출하게 한다."""
     params = build_stdio_params(server)
+    llm = build_backend(backend, base_url)
 
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tool_list = await session.list_tools()
-            tools = [_mcp_tool_to_ollama(tool) for tool in tool_list.tools]
+            tools = [_mcp_tool_to_tool_spec(tool) for tool in tool_list.tools]
 
             system = (
                 "너는 연결된 tool만 사용해서 사용자 질문에 답하는 도우미야. "
@@ -279,15 +286,15 @@ async def ask(server: McpServerDefinition, question: str, model: str) -> dict[st
             map_center: dict[str, Any] | None = None
             map_points: list[dict[str, Any]] = []
 
+            _log(f"backend={backend} model={model} base_url={base_url!r}")
             _log(f"question: {question!r}")
             for round_no in range(MAX_TOOL_ROUNDS):
                 _log(f"round {round_no}: calling {model}...")
-                response = ollama.chat(model=model, messages=messages, tools=tools, think=False)
-                message = response.message
-                messages.append(message)
+                message = llm.chat(model, messages, tools)
+                messages.append(message.history_entry)
 
                 if not message.tool_calls:
-                    answer = message.content or getattr(message, "thinking", None)
+                    answer = message.content
                     _log(f"round {round_no}: final answer ({len(answer or '')} chars): {(answer or '')[:200]}")
                     map_data = {"center": map_center, "points": map_points} if map_center else None
                     return {"answer": answer or "(응답 없음)", "map": map_data}
@@ -300,14 +307,12 @@ async def ask(server: McpServerDefinition, question: str, model: str) -> dict[st
                     if call_key in seen_calls:
                         _log(f"round {round_no}: duplicate tool call detected, skipping re-execution")
                         messages.append(
-                            {
-                                "role": "tool",
-                                "content": (
-                                    "이 tool은 방금 같은 조건으로 이미 호출했어. 다시 실행하지 않았으니 "
-                                    "직전 결과를 그대로 근거로 삼아 답변해."
-                                ),
-                                "tool_name": tool_call.function.name,
-                            }
+                            llm.tool_result_entry(
+                                tool_call,
+                                tool_call.function.name,
+                                "이 tool은 방금 같은 조건으로 이미 호출했어. 다시 실행하지 않았으니 "
+                                "직전 결과를 그대로 근거로 삼아 답변해.",
+                            )
                         )
                         continue
                     seen_calls.add(call_key)
@@ -327,13 +332,7 @@ async def ask(server: McpServerDefinition, question: str, model: str) -> dict[st
                         f"round {round_no}: tool result "
                         f"({len(result_text)} chars): {result_text[:200]}"
                     )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "content": result_text,
-                            "tool_name": tool_call.function.name,
-                        }
-                    )
+                    messages.append(llm.tool_result_entry(tool_call, tool_call.function.name, result_text))
 
             _log(f"exhausted {MAX_TOOL_ROUNDS} rounds without a final answer")
             map_data = {"center": map_center, "points": map_points} if map_center else None

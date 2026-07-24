@@ -24,7 +24,11 @@ def _query(role: str, question: str) -> dict[str, Any]:
 
     try:
         if local_model:
-            return asyncio.run(ask_local_agent(server, question, local_model))
+            local_backend = settings.get("local_backend", "ollama")
+            vllm_base_url = settings.get("vllm_base_url")
+            return asyncio.run(
+                ask_local_agent(server, question, local_model, backend=local_backend, base_url=vllm_base_url)
+            )
         if api_key:
             return asyncio.run(ask_cloud_agent(server, question, api_key))
         result = asyncio.run(call_tool(server, question))
