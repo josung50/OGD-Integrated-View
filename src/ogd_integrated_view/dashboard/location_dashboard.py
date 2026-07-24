@@ -181,6 +181,22 @@ def render_location_dashboard() -> None:
     def _query_resident_opinions(_question: str) -> dict:
         return _fetch_resident_opinions(apartment_query)
 
+    def _query_commercial_district(_question: str) -> dict:
+        """작은 로컬 모델은 이미 준 상권 데이터를 무시하고 엉뚱한 tool을 호출하는
+        경우가 잦아(프롬프트로 못 고침), 실거주자 의견종합과 같은 방식으로 LLM을
+        거치지 않고 이미 조회해둔 상권 데이터를 그대로 반환한다."""
+        commercial = result.get("commercial")
+        if not commercial or not commercial.get("by_category"):
+            return {"answer": "반경 내 상권 정보를 찾지 못했습니다.", "map": None}
+        sample_note = (
+            f" (전체 중 가까운 {commercial['sampled_count']:,}건 표본 기준)"
+            if commercial["sampled_count"] < commercial["total_count"]
+            else ""
+        )
+        lines = "\n".join(f"- {row['category']}: {row['count']}건" for row in commercial["by_category"])
+        answer = f"반경 내 총 상가 {commercial['total_count']:,}건{sample_note}\n\n{lines}"
+        return {"answer": answer, "map": None}
+
     st.divider()
     with st.expander("💬 추가로 질문하기 (AI에게 자유롭게 물어보기)"):
         st.caption(f"현재 '{address_context}' 기준으로 질문에 답합니다.")
@@ -190,7 +206,10 @@ def render_location_dashboard() -> None:
             placeholder="예: 이 아파트 투자가치 평가해줘",
             examples=["이 위치 투자가치 평가해줘", "주변 학원 알려줘", RESIDENT_OPINION_EXAMPLE],
             query_fn=_query_with_context,
-            example_overrides={RESIDENT_OPINION_EXAMPLE: _query_resident_opinions},
+            example_overrides={
+                RESIDENT_OPINION_EXAMPLE: _query_resident_opinions,
+                "상권": _query_commercial_district,
+            },
         )
 
 

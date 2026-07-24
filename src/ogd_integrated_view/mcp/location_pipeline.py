@@ -14,6 +14,7 @@ CONVENIENCE_CATEGORIES = ["편의점", "카페", "은행", "약국"]
 INFRA_CATEGORIES = ["대학병원", "대형마트"]
 SCHOOL_LEVELS = ["초등학교", "중학교", "고등학교"]
 MAX_POINTS_PER_CATEGORY = 15
+MAX_TRANSACTIONS = 100
 
 
 def _tool_result_json(result: Any) -> dict[str, Any] | None:
@@ -173,9 +174,16 @@ async def analyze_all(server: McpServerDefinition, address: str, radius_km: floa
             else:
                 errors["transactions"] = "주소에서 지역(시/군/구)을 인식하지 못해 실거래가를 조회할 수 없습니다"
 
-    for points in categories.values():
+    for key, points in categories.items():
+        if key == "transactions":
+            continue
         points.sort(key=lambda p: p.get("distance_m", 0))
         del points[MAX_POINTS_PER_CATEGORY:]
+
+    # 실거래는 거리순 상위 몇 건이 아니라, 거래일 내림차순으로 최근 것부터 최대
+    # MAX_TRANSACTIONS건 그대로 보여준다 (날짜 형식이 없는 항목은 맨 뒤로 보낸다).
+    categories["transactions"].sort(key=lambda p: p.get("date") or "", reverse=True)
+    del categories["transactions"][MAX_TRANSACTIONS:]
 
     _fill_transaction_building_names(categories["transactions"])
 
@@ -199,7 +207,9 @@ def _fill_transaction_building_names(transactions: list[dict[str, Any]]) -> None
 
     건물명을 찾지 못하면(단독주택 등) 기존 이름(도로명 폴백)을 그대로 둔다.
     같은 반경 내 여러 거래가 같은 건물에서 나오는 경우가 많아 주소별로 캐시해서
-    중복 조회를 줄인다 (트리밍 이후에만 실행하므로 호출 수도 최대 15건으로 제한됨).
+    중복 조회를 줄인다 (트리밍 이후에만 실행하므로 호출 수도 최대 MAX_TRANSACTIONS건으로
+    제한됨). XML API가 대부분 실제 건물명(아파트명)을 이미 채워주므로 실제로는
+    이름이 비어 있는 소수 항목에만 호출이 발생한다.
     """
     cache: dict[str, str | None] = {}
     for point in transactions:

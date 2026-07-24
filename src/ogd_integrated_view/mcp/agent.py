@@ -251,7 +251,14 @@ async def ask(server: McpServerDefinition, question: str, api_key: str) -> dict[
                 "같은 종류의 실패가 반복되면 무리하게 다른 값을 추측해서 tool을 더 부르지 말고, "
                 "부족한 정보가 뭔지 사용자에게 짧게 되물어보는 것으로 답변을 끝내. "
                 "tool 결과 맨 앞에 '[경고: ...]' 문구가 있으면 더 이상 다른 tool을 호출하지 말고, "
-                "그 경고 내용을 사용자에게 짧게 안내하는 것으로 답변을 끝내."
+                "그 경고 내용을 사용자에게 짧게 안내하는 것으로 답변을 끝내. "
+                "evaluate_investment_value/evaluate_life_quality/recommend_property처럼 "
+                "price/area/floor/building_year 같은 특정 매물 값을 요구하는 tool을 부를 땐, "
+                "절대 값을 지어내지 마. 반드시 먼저 get_nearby_apartment_transactions(또는 "
+                "search_by_road_address)로 그 주소의 실제 최근 실거래를 조회하고, 그 결과 중 "
+                "하나(가장 가깝거나 가장 최근 거래)의 실제 가격·면적·층·건축연도를 그대로 넣어. "
+                "실거래를 하나도 못 찾았으면 그 사실을 사용자에게 짧게 알리고, 임의의 값으로 "
+                "평가 tool을 호출하지 마."
             )
             messages: list[dict[str, Any]] = [{"role": "user", "content": question}]
             seen_calls: set[tuple[str, str]] = set()

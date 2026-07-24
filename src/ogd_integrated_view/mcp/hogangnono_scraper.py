@@ -121,9 +121,11 @@ async def _get_fresh_kakao_login_url(p) -> str:
         # 카카오 로그인 버튼이 나타날 때까지 (닫기 → 재클릭)을 몇 번 재시도한다.
         kakao_login_btn = page.locator('[data-ga-event="auth,loginKakao"]')
         for _ in range(4):
-            # 채팅/광고 위젯 등 작은 고정 UI가 여전히 살짝 겹치는 경우가 있어 강제로 클릭한다
-            await page.get_by_test_id("guest-login-button").click(timeout=10_000, force=True)
             try:
+                # 채팅/광고 위젯 등 작은 고정 UI가 여전히 살짝 겹치는 경우가 있어 강제로 클릭한다.
+                # 홍보 모달이 게스트 로그인 버튼 자체를 display:none으로 가려버리는 경우도 있어
+                # (force=True로도 못 뚫음) 이 클릭 실패도 재시도 대상에 포함한다.
+                await page.get_by_test_id("guest-login-button").click(timeout=10_000, force=True)
                 await kakao_login_btn.wait_for(state="visible", timeout=1200)
                 break
             except Exception:
@@ -217,14 +219,29 @@ async def find_apartment_url(query: str, cookie_header: str) -> str | None:
             await search_input.press("Enter")
             await page.wait_for_timeout(2000)
 
-            # 검색 결과 목록의 첫 아파트 링크로 이동 (이미 상세로 바로 이동했으면 그대로 둔다).
+            # 검색 결과 목록에서 이동할 링크를 고른다 (이미 상세로 바로 이동했으면 그대로 둔다).
             # 클릭은 화면 위 모달/오버레이에 가로막히는 경우가 있어, href를 읽어 직접 이동한다.
+            # 첫 번째 결과가 항상 정답은 아니다 — 호갱노노 검색이 "문촌마을7단지아파트"를
+            # 검색해도 전혀 다른 지역의 "OO7단지"를 1순위로 주고 실제로 찾는 "문촌마을7단지"는
+            # 2순위로 내놓는 경우가 있어, 검색어의 핵심 이름이 그대로 들어간 결과를 우선한다.
             if "/apt/" not in page.url:
-                first_result = page.locator('a[href*="/apt/"]').first
+                query_core = re.sub(r"(아파트|apt)$", "", query.replace(" ", ""), flags=re.IGNORECASE)
+                results = page.locator('a[href*="/apt/"]')
                 try:
-                    href = await first_result.get_attribute("href", timeout=5000)
+                    count = await results.count()
                 except Exception:
-                    return None
+                    count = 0
+                href = None
+                for i in range(count):
+                    result_text = (await results.nth(i).inner_text()).replace(" ", "").replace("\n", "")
+                    if query_core and query_core in result_text:
+                        href = await results.nth(i).get_attribute("href")
+                        break
+                if href is None:
+                    try:
+                        href = await results.first.get_attribute("href", timeout=5000)
+                    except Exception:
+                        return None
                 if not href:
                     return None
                 await page.goto(HOMEPAGE_URL.rstrip("/") + href, timeout=PAGE_LOAD_TIMEOUT_MS)
