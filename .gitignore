@@ -18,5 +18,8 @@ data/mcp_servers.json
 data/app_settings.json
 data/sources/
 
-# Vendored external MCP server repos (not our code)
-vendor/
+# Vendored external MCP server repos - only A2A-MCP-RealEstate (actually in use)
+# is included in this project; the others are unused candidates kept locally.
+vendor/*
+!vendor/A2A-MCP-RealEstate/
+vendor/A2A-MCP-RealEstate/.venv/

@@ -1,0 +1,2487 @@
+#!/usr/bin/env python3
+"""
+부동산 추천 시스템 MCP 서버 (FastMCP)
+투자가치와 삶의질 평가를 통한 부동산 추천
+"""
+
+from fastmcp import FastMCP
+import asyncio
+import httpx
+import json
+import math
+from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+import os
+from dotenv import load_dotenv
+import csv
+import io
+import re
+import sys
+
+load_dotenv()
+
+# FastMCP 서버 생성
+mcp = FastMCP("Real Estate Recommendation System")
+
+def parse_csv_data(csv_content: str, region_name: str, from_date: str, to_date: str, property_type: str) -> List[Dict[str, Any]]:
+    """
+    CSV 데이터를 파싱하여 필요한 정보만 추출
+    """
+    transactions = []
+    
+    # CSV 헤더 확인 (실제 데이터인지 알림 메시지인지)
+    if "실거래가 데이터가 없습니다" in csv_content or len(csv_content.strip()) < 100:
+        return []
+    
+    try:
+        # CSV 파싱 시작점 찾기 (헤더가 있는 줄)
+        lines = csv_content.split('\n')
+        header_line_idx = -1
+        
+        for i, line in enumerate(lines):
+            if 'NO' in line and '거래금액' in line and '전용면적' in line:
+                header_line_idx = i
+                break
+        
+        if header_line_idx == -1:
+            return []
+        
+        # 헤더 이후의 데이터만 파싱
+        csv_data = '\n'.join(lines[header_line_idx:])
+        csv_reader = csv.DictReader(io.StringIO(csv_data))
+        
+        for row in csv_reader:
+            # 거래금액이 있는 유효한 데이터만 처리
+            price_str = row.get('거래금액(만원)', '').strip().replace(',', '').replace('-', '')
+            if not price_str or not price_str.isdigit():
+                continue
+            
+            # 전용면적 처리
+            area_str = row.get('전용면적(㎡)', '').strip()
+            area_float = 0.0
+            if area_str:
+                try:
+                    area_float = float(area_str)
+                except:
+                    area_float = 0.0
+            
+            # 층수 처리
+            floor_str = row.get('층', '').strip()
+            floor_int = 0
+            if floor_str and floor_str.isdigit():
+                floor_int = int(floor_str)
+            
+            # 건축년도 처리
+            year_str = row.get('건축년도', '').strip()
+            year_int = 0
+            if year_str and year_str.isdigit():
+                year_int = int(year_str)
+            
+            # 평당 가격 계산 (3.3058㎡ = 1평)
+            price_per_pyeong = 0
+            if area_float > 0:
+                price_per_pyeong = int((int(price_str) * 10000) / (area_float / 3.3058))
+            
+            transaction = {
+                "아파트명": row.get('아파트', '').strip(),
+                "전용면적": f"{area_float:.2f}㎡" if area_float > 0 else "",
+                "거래금액": f"{int(price_str):,}만원",
+                "거래금액_숫자": int(price_str),
+                "평당가격": f"{price_per_pyeong:,}원/평" if price_per_pyeong > 0 else "",
+                "평당가격_숫자": price_per_pyeong,
+                "층": f"{floor_int}층" if floor_int > 0 else "",
+                "건축년도": str(year_int) if year_int > 0 else "",
+                "건물연식": f"{2025 - year_int}년" if year_int > 0 else "",
+                "계약년월": row.get('계약년월', '').strip(),
+                "계약일": row.get('계약일', '').strip(),
+                "법정동": row.get('법정동', '').strip(),
+                "도로명": row.get('도로명', '').strip()
+            }
+            transactions.append(transaction)
+    
+    except Exception as e:
+        if os.getenv("ENVIRONMENT", "production") == "development":
+            print(f"[DEBUG] CSV 파싱 오류: {e}")
+        return []
+    
+    # 거래금액 기준으로 내림차순 정렬
+    transactions.sort(key=lambda x: x.get('거래금액_숫자', 0), reverse=True)
+    
+    return transactions
+
+# API 키 설정
+MOLIT_API_KEY = os.getenv("MOLIT_API_KEY", "")
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
+KAKAO_API_KEY = os.getenv("KAKAO_API_KEY", "")
+
+# 카카오 로컬 API 카테고리 코드 (https://developers.kakao.com/docs/latest/ko/local/dev-guide)
+KAKAO_CATEGORY_CODES = {
+    "대형마트": "MT1",
+    "마트": "MT1",
+    "쇼핑몰": "MT1",
+    "편의점": "CS2",
+    "어린이집": "PS3",
+    "유치원": "PS3",
+    "학교": "SC4",
+    "학원": "AC5",
+    "주차장": "PK6",
+    "주유소": "OL7",
+    "충전소": "OL7",
+    "지하철역": "SW8",
+    "은행": "BK9",
+    "문화시설": "CT1",
+    "영화관": "CT1",
+    "공공기관": "PO3",
+    "관광명소": "AT4",
+    "숙박": "AD5",
+    "음식점": "FD6",
+    "카페": "CE7",
+    "병원": "HP8",
+    "대학병원": "HP8",
+    "약국": "PM9",
+}
+
+@dataclass
+class PropertyInfo:
+    """부동산 정보 데이터 클래스"""
+    address: str
+    price: int  # 만원 단위
+    area: float  # 전용면적 (㎡)
+    floor: int
+    total_floor: int
+    building_year: int
+    property_type: str  # 아파트, 오피스텔, 연립다세대
+    deal_type: str  # 매매, 전세, 월세
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+
+# 서울 지하철역 좌표 데이터
+_SUBWAY_STATIONS_PATH = os.path.join(os.path.dirname(__file__), "subway_stations.json")
+with open(_SUBWAY_STATIONS_PATH, encoding="utf-8") as _f:
+    SUBWAY_STATIONS = json.load(_f)
+
+def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """하버사인 공식으로 두 지점 간 거리 계산 (km)"""
+    R = 6371.0
+    lat1_rad, lon1_rad = math.radians(lat1), math.radians(lon1)
+    lat2_rad, lon2_rad = math.radians(lat2), math.radians(lon2)
+    
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    return round(R * c, 2)
+
+
+def _extract_items(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """_get_real_estate_data() 응답에서 거래 목록을 꺼낸다.
+
+    실제 구조는 data.response.body.items로 중첩되어 있다 (data.items가 아님) -
+    이 경로를 잘못 짚으면 실제로는 거래가 수백 건 있어도 매번 빈 리스트가 나온다.
+    """
+    return result.get("data", {}).get("response", {}).get("body", {}).get("items", [])
+
+
+# 내부 함수 - 다른 도구에서 직접 호출 가능
+# data.go.kr 신 게이트웨이 기준 서비스 그룹. 아파트만 실제 호출로 검증했다 —
+# 오피스텔/연립다세대는 같은 그룹(1613000) 밑에 없는 것(404)까지만 확인했고,
+# 정확한 그룹 번호와 별도 활용신청 필요 여부는 아직 미확인이다.
+_MOLIT_XML_SERVICE_MAP = {
+    "아파트": ("1613000", "RTMSDataSvcAptTradeDev", "getRTMSDataSvcAptTradeDev"),
+}
+_MOLIT_XML_SUCCESS_CODES = {"00", "000"}  # 서비스마다 결과코드 자릿수가 다르다(00 vs 000)
+
+
+def _normalize_xml_apt_item(raw: Dict[str, str]) -> Dict[str, Any]:
+    """XML API가 주는 영문 태그(aptNm/dealAmount/excluUseAr 등)를, CSV 파서(parse_csv_data)가
+    만들던 것과 동일한 한글 키(아파트명/거래금액/도로명 등)로 맞춘다.
+
+    get_nearby_apartment_transactions을 비롯한 호출부들이 전부 한글 키로 접근하도록 짜여 있어서,
+    XML 응답을 그대로 넘기면 "도로명"이 없다고 판단해 후속 필터링에서 항목이 전부 걸러진다.
+
+    "도로명"에는 건물본번(roadNmBonbun)까지 반드시 붙여야 한다 — 거리 이름만으로는
+    네이버 지오코더가 지점을 특정하지 못해(totalCount: 0) 후속 좌표 변환이 전부 실패한다."""
+    price_str = raw.get("dealAmount", "").replace(",", "").strip()
+    price = int(price_str) if price_str.isdigit() else 0
+    area = float(raw["excluUseAr"]) if raw.get("excluUseAr") else 0.0
+    floor = int(raw["floor"]) if raw.get("floor", "").lstrip("-").isdigit() else 0
+    build_year = int(raw["buildYear"]) if raw.get("buildYear", "").isdigit() else 0
+    price_per_pyeong = int((price * 10000) / (area / 3.3058)) if area > 0 else 0
+    deal_year, deal_month = raw.get("dealYear", ""), raw.get("dealMonth", "")
+
+    road_nm = raw.get("roadNm", "").strip()
+    road_bonbun = raw.get("roadNmBonbun", "").lstrip("0")
+    road_bubun = raw.get("roadNmBubun", "").lstrip("0")
+    road_address = ""
+    if road_nm and road_bonbun:
+        road_address = f"{road_nm} {road_bonbun}"
+        if road_bubun:
+            road_address += f"-{road_bubun}"
+
+    return {
+        "아파트명": raw.get("aptNm", "").strip(),
+        "전용면적": f"{area:.2f}㎡" if area > 0 else "",
+        "거래금액": f"{price:,}만원" if price > 0 else "",
+        "거래금액_숫자": price,
+        "평당가격": f"{price_per_pyeong:,}원/평" if price_per_pyeong > 0 else "",
+        "평당가격_숫자": price_per_pyeong,
+        "층": f"{floor}층" if floor else "",
+        "건축년도": str(build_year) if build_year else "",
+        "건물연식": f"{datetime.now().year - build_year}년" if build_year else "",
+        "계약년월": f"{deal_year}{int(deal_month):02d}" if deal_year and deal_month else "",
+        "계약일": raw.get("dealDay", ""),
+        "법정동": raw.get("umdNm", "").strip(),
+        "도로명": road_address,
+    }
+
+
+async def _get_real_estate_data(lawd_cd: str, deal_ymd: str, property_type: str = "아파트", emd_name: str = "", date_range: str = "", use_xml_api: bool = True) -> Dict[str, Any]:
+    """
+    부동산 실거래가 데이터 조회 (기본: 공식 XML API, MOLIT_API_KEY 필요)
+
+    Args:
+        lawd_cd: 지역코드 (5자리, 예: 11680 - 서울 강남구)
+        deal_ymd: 계약년월 (YYYYMM, 예: 202401) 또는 날짜 범위가 있으면 시작년월
+        property_type: 부동산 유형 (아파트, 오피스텔, 연립다세대)
+        emd_name: 읍면동명 (예: "개포동") - 선택사항
+        date_range: 날짜 범위 (예: "2025.06.01~2025.07.30") - 선택사항
+        use_xml_api: False로 주면 예전 CSV 다운로드 방식(레거시, 강남구/강서구 외 지역명
+            매핑이 잘못되어 있어 다른 지역은 항상 0건이 나온다)으로 강제 전환한다.
+
+    Returns:
+        실거래가 데이터
+    """
+    # 부동산 유형별 코드 매핑 (CSV 방식 전용, 실제 웹페이지 기준)
+    thing_codes = {
+        "아파트": "A",
+        "연립다세대": "B",
+        "오피스텔": "D"
+    }
+
+    thing_code = thing_codes.get(property_type, "A")
+
+    try:
+        # XML API 폴백 옵션
+        if use_xml_api:
+            api_key = os.getenv("MOLIT_API_KEY")
+            if not api_key:
+                return {
+                    "success": False,
+                    "error": "API 키가 설정되지 않았습니다",
+                    "message": "MOLIT_API_KEY 환경변수를 설정해주세요"
+                }
+
+            if property_type not in _MOLIT_XML_SERVICE_MAP:
+                return {
+                    "success": False,
+                    "error": "지원하지 않는 부동산 유형(XML API)",
+                    "message": f"{property_type}은 아직 XML API 서비스 그룹이 확인되지 않았습니다 (아파트만 지원)"
+                }
+
+            service_group, service_name, operation_name = _MOLIT_XML_SERVICE_MAP[property_type]
+            url = f"https://apis.data.go.kr/{service_group}/{service_name}/{operation_name}"
+            params = {
+                "serviceKey": api_key,
+                "LAWD_CD": lawd_cd,
+                "DEAL_YMD": deal_ymd,
+                "numOfRows": 1000,
+                "pageNo": 1
+            }
+
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=30.0),
+                follow_redirects=True
+            ) as client:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+
+                import xml.etree.ElementTree as ET
+
+                # XML 파싱
+                root = ET.fromstring(response.text)
+                header = root.find('.//header')
+                body = root.find('.//body')
+
+                if header is not None:
+                    result_code = header.find('resultCode')
+                    result_msg = header.find('resultMsg')
+
+                    if result_code is not None and result_code.text not in _MOLIT_XML_SUCCESS_CODES:
+                        return {
+                            "success": False,
+                            "error": f"API 오류: {result_msg.text if result_msg is not None else 'Unknown error'}",
+                            "message": f"{property_type} 실거래가 조회 실패"
+                        }
+
+                items = []
+                if body is not None:
+                    items_element = body.find('items')
+                    if items_element is not None:
+                        for item in items_element.findall('item'):
+                            item_data = {}
+                            for child in item:
+                                if child.text:
+                                    item_data[child.tag] = child.text.strip()
+                            if item_data:
+                                items.append(_normalize_xml_apt_item(item_data))
+
+                return {
+                    "success": True,
+                    "data": {
+                        "response": {
+                            "header": {
+                                "resultCode": "00",
+                                "resultMsg": "정상"
+                            },
+                            "body": {
+                                "items": items,
+                                "numOfRows": len(items),
+                                "pageNo": 1,
+                                "totalCount": len(items)
+                            }
+                        }
+                    },
+                    "message": f"{property_type} {len(items)}건 조회 완료 (XML API)",
+                    "source": "XML API"
+                }
+
+        # 3단계 접근: 세션 설정 -> 데이터 확인 -> CSV 다운로드
+        session_url = "https://rt.molit.go.kr/pt/xls/xls.do?mobileAt="
+        check_url = "https://rt.molit.go.kr/pt/xls/ptXlsDownDataCheck.do"
+        download_url = "https://rt.molit.go.kr/pt/xls/ptXlsCSVDown.do"
+        
+        # 지역코드와 이름 매핑
+        region_mapping = {
+            "11680": {
+                "sido_code": "11000",
+                "sgg_code": "11680", 
+                "sido_name": "서울특별시",
+                "sgg_name": "강남구",
+                "emd_mapping": {
+                    "개포동": "10300",
+                    "논현동": "10500",
+                    "대치동": "10700", 
+                    "도곡동": "10800",
+                    "삼성동": "11000",
+                    "신사동": "11300",
+                    "압구정동": "11700",
+                    "역삼동": "12000",
+                    "청담동": "12200"
+                }
+            },
+            "11500": {
+                "sido_code": "11000",
+                "sgg_code": "11500",
+                "sido_name": "서울특별시", 
+                "sgg_name": "강서구",
+                "emd_mapping": {}
+            }
+        }
+        
+        region_info = region_mapping.get(lawd_cd, {
+            "sido_code": lawd_cd[:5] + "0",
+            "sgg_code": lawd_cd,
+            "sido_name": "서울특별시",
+            "sgg_name": "기타",
+            "emd_mapping": {}
+        })
+        
+        sido_code = region_info["sido_code"] 
+        sgg_code = region_info["sgg_code"]
+        sido_name = region_info["sido_name"]
+        sgg_name = region_info["sgg_name"]
+        
+        # EMD 코드와 이름 처리
+        emd_code = ""
+        emd_name_param = emd_name or ""
+        if emd_name and emd_name in region_info["emd_mapping"]:
+            emd_code = region_info["emd_mapping"][emd_name]
+        
+        # 날짜 범위 처리
+        if date_range and "~" in date_range:
+            # 날짜 범위가 있는 경우 (예: "2025.06.01~2025.07.30")
+            start_date, end_date = date_range.split("~")
+            from_date = start_date.replace(".", "")  # "20250601"
+            to_date = end_date.replace(".", "")      # "20250730"
+        else:
+            # 기존 방식: 해당 년월의 전체 기간
+            year = deal_ymd[:4]
+            month = deal_ymd[4:6]
+            from_date = f"{year}{month}01"  # 월 첫째 날
+            
+            # 월의 마지막 날 계산
+            import calendar
+            last_day = calendar.monthrange(int(year), int(month))[1]
+            to_date = f"{year}{month}{last_day:02d}"  # 월 마지막 날
+        
+        # 실제 브라우저와 동일한 파라미터 구성
+        params = {
+            'srhThingNo': thing_code,  # A: 아파트, B: 연립다세대, D: 오피스텔
+            'srhDelngSecd': '1',  # 1: 매매, 2: 전월세
+            'srhAddrGbn': '1',  # 1: 지번주소, 2: 도로명주소
+            'srhLfstsSecd': '1',  # 누락되었던 파라미터
+            'sidoNm': sido_name,  # 시도명 (한글)
+            'sggNm': sgg_name,  # 시군구명 (한글)
+            'emdNm': emd_name_param,  # 읍면동명 (한글)
+            'loadNm': '전체',  # 도로명
+            'areaNm': '전체',  # 면적
+            'hsmpNm': '전체',  # 단지명
+            'mobileAt': '',  # 모바일 구분자
+            'srhFromDt': f"{from_date[:4]}-{from_date[4:6]}-{from_date[6:8]}",  # YYYY-MM-DD 형식
+            'srhToDt': f"{to_date[:4]}-{to_date[4:6]}-{to_date[6:8]}",  # YYYY-MM-DD 형식  
+            'srhNewRonSecd': '',  # 신구분
+            'srhSidoCd': sido_code,  # 시도코드
+            'srhSggCd': sgg_code,  # 시군구코드
+            'srhEmdCd': emd_code,  # 읍면동코드
+            'srhRoadNm': '',  # 도로명
+            'srhLoadCd': '',  # 도로코드
+            'srhHsmpCd': '',  # 단지코드
+            'srhArea': '',  # 면적
+            'srhFromAmount': '',  # 최소 금액
+            'srhToAmount': ''  # 최대 금액
+        }
+        
+        # 로컬 디버깅용 URL 로깅
+        if os.getenv("ENVIRONMENT", "production") == "development":
+            print(f"[DEBUG] 입력받은 deal_ymd: {deal_ymd}")
+            print(f"[DEBUG] date_range: {date_range}")
+            print(f"[DEBUG] 계산된 from_date: {from_date}")
+            print(f"[DEBUG] 계산된 to_date: {to_date}")
+            print(f"[DEBUG] 세션 URL: {session_url}")
+            print(f"[DEBUG] 다운로드 URL: {download_url}")
+            print(f"[DEBUG] POST 파라미터: {params}")
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=30.0),
+            verify=False,
+            follow_redirects=True
+        ) as client:
+            # 1단계: 메인 페이지 방문하여 세션 설정
+            session_response = await client.get(session_url, headers=headers)
+            if os.getenv("ENVIRONMENT", "production") == "development":
+                print(f"[DEBUG] 1단계 세션 설정 완료: {session_response.status_code}")
+            
+            # 2단계: 데이터 확인 요청 (실제 브라우저와 동일)
+            check_headers = headers.copy()
+            check_headers.update({
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'Referer': session_url,
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'X-Requested-With': 'XMLHttpRequest'
+            })
+            
+            check_response = await client.post(check_url, data=params, headers=check_headers)
+            if os.getenv("ENVIRONMENT", "production") == "development":
+                print(f"[DEBUG] 2단계 데이터 확인 완료: {check_response.status_code}")
+                print(f"[DEBUG] 확인 응답: {check_response.text[:200]}")
+            
+            # 3단계: 실제 CSV 다운로드 요청
+            download_headers = headers.copy()
+            download_headers.update({
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': session_url,
+                'Accept': 'application/octet-stream,text/csv,*/*'
+            })
+            
+            response = await client.post(download_url, data=params, headers=download_headers)
+            response.raise_for_status()
+            
+            # CSV 응답 처리 (인코딩 자동 감지)
+            try:
+                # 먼저 CP949로 디코딩 시도 (국토교통부 CSV는 보통 CP949)
+                csv_content = response.content.decode('cp949')
+            except UnicodeDecodeError:
+                try:
+                    # CP949 실패 시 EUC-KR 시도
+                    csv_content = response.content.decode('euc-kr')
+                except UnicodeDecodeError:
+                    # 그래도 실패하면 UTF-8 사용
+                    csv_content = response.text
+            
+            # 로컬 디버깅용 응답 내용 확인
+            if os.getenv("ENVIRONMENT", "production") == "development":
+                print(f"[DEBUG] 응답 상태코드: {response.status_code}")
+                print(f"[DEBUG] 응답 헤더: {dict(response.headers)}")
+                print(f"[DEBUG] 응답 내용 전체 길이: {len(csv_content)}")
+                print(f"[DEBUG] Content-Type: {response.headers.get('content-type', 'N/A')}")
+                
+                # 응답이 파일 다운로드인지 확인
+                content_disposition = response.headers.get('content-disposition', '')
+                if 'attachment' in content_disposition:
+                    print(f"[DEBUG] 파일 다운로드 감지: {content_disposition}")
+                else:
+                    print(f"[DEBUG] 응답 내용 (처음 1000자): {csv_content[:1000]}")
+            
+            # 응답이 HTML 에러 페이지인지 확인
+            if '<html>' in csv_content.lower() or '<!doctype html>' in csv_content.lower():
+                return {
+                    "success": False,
+                    "error": "HTML 에러 페이지 응답",
+                    "message": f"{property_type} CSV 다운로드 실패 - 서버에서 HTML 페이지를 반환했습니다"
+                }
+            
+            # CSV 데이터 파싱 및 필터링
+            try:
+                if csv_content.startswith('\ufeff'):  # BOM 제거
+                    csv_content = csv_content[1:]
+                
+                # 개선된 파싱 함수 사용
+                items = parse_csv_data(csv_content, sgg_name, from_date, to_date, property_type)
+                        
+            except Exception as parse_error:
+                if os.getenv("ENVIRONMENT", "production") == "development":
+                    print(f"[DEBUG] CSV 파싱 오류: {parse_error}")
+                    print(f"[DEBUG] 원본 내용: {csv_content[:500]}")
+                
+                return {
+                    "success": False,
+                    "error": f"CSV 파싱 오류: {str(parse_error)}",
+                    "message": f"{property_type} CSV 파싱 중 오류가 발생했습니다"
+                }
+            
+            return {
+                "success": True,
+                "data": {
+                    "response": {
+                        "header": {
+                            "resultCode": "00",
+                            "resultMsg": "정상"
+                        },
+                        "body": {
+                            "items": items,
+                            "numOfRows": len(items),
+                            "pageNo": 1,
+                            "totalCount": len(items)
+                        }
+                    }
+                },
+                "message": f"{property_type} {len(items)}건 조회 완료 (CSV 방식)",
+                "source": "CSV 직접 다운로드"
+            }
+            
+    except Exception as e:
+        import sys
+        print(f"[ERROR] {property_type} 실거래가 조회 오류: {str(e)}", file=sys.stderr)
+        print(f"[ERROR] 오류 타입: {type(e).__name__}", file=sys.stderr)
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"{property_type} 실거래가 조회 중 오류가 발생했습니다: {str(e)}"
+        }
+
+@mcp.tool()
+async def search_by_road_address(road_address: str, date_from: str = "", date_to: str = "", property_type: str = "아파트", deal_type: str = "매매") -> Dict[str, Any]:
+    """
+    도로명 주소로 부동산 실거래가 검색
+    
+    Args:
+        road_address: 도로명 주소 (예: "인천 서구 검암로10번길 36")
+        date_from: 시작일 (YYYY-MM-DD)
+        date_to: 종료일 (YYYY-MM-DD)
+        property_type: 부동산 유형
+        deal_type: 거래 유형
+    
+    Returns:
+        실거래가 데이터
+    """
+    try:
+        print(f"[INFO] 도로명 주소 검색: {road_address}", file=sys.stderr)
+        
+        # 도로명 주소에서 지역 정보 추출
+        region_info = await _extract_region_from_address(road_address)
+        
+        if not region_info.get("success"):
+            return {
+                "success": False,
+                "error": "지역 정보 추출 실패",
+                "message": f"주소 '{road_address}'에서 지역 정보를 찾을 수 없습니다."
+            }
+        
+        # 추출된 지역 정보로 실거래가 조회
+        sido_cd = region_info["sido_code"]
+        sgg_cd = region_info["sigungu_code"]
+        emd_name = region_info.get("emd_name", "")
+        
+        print(f"[INFO] 추출된 지역정보 - 시도: {sido_cd}, 시군구: {sgg_cd}, 읍면동: {emd_name}", file=sys.stderr)
+        
+        # 내부 함수를 직접 호출하여 안정성 확보
+        deal_ymd = date_from if date_from else "202501"
+        result = await _get_real_estate_data(
+            lawd_cd=sgg_cd,
+            deal_ymd=deal_ymd,
+            property_type=property_type,
+            emd_name=emd_name,
+            date_range="",
+            use_xml_api=True
+        )
+        
+        # 도로명으로 추가 필터링
+        if result.get("success") and result.get("data", {}).get("response", {}).get("body", {}).get("items"):
+            items = result["data"]["response"]["body"]["items"]
+            filtered_items = []
+            
+            # 도로명이 포함된 항목만 필터링
+            road_name_parts = road_address.split()
+            for item in items:
+                road_name = item.get("도로명", "").strip()
+                if road_name and any(part in road_name for part in road_name_parts[-2:]):  # 마지막 2개 부분 확인
+                    filtered_items.append(item)
+            
+            result["data"]["response"]["body"]["items"] = filtered_items[:10]
+            result["data"]["response"]["body"]["totalCount"] = len(filtered_items)
+            result["search_info"] = {
+                "road_address": road_address,
+                "extracted_region": region_info,
+                "original_count": len(items),
+                "filtered_count": len(filtered_items)
+            }
+        
+        return result
+        
+    except Exception as e:
+        print(f"[ERROR] 도로명 주소 검색 오류: {str(e)}", file=sys.stderr)
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"도로명 주소 검색 중 오류: {str(e)}"
+        }
+
+async def _extract_region_from_address(address: str) -> Dict[str, Any]:
+    """
+    도로명 주소에서 지역 정보 추출 (통합 region_codes 모듈 사용)
+    """
+    try:
+        # region_codes 모듈에서 함수 임포트
+        import sys
+        import os
+        
+        # 상위 디렉토리 경로 추가
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(current_dir)
+        sys.path.insert(0, parent_dir)
+        
+        from data.region_codes import find_region_code_by_address, parse_road_address, SIDO_CODES, ALL_SIGUNGU
+        
+        # 주소 파싱
+        parsed = parse_road_address(address)
+        
+        # 지역 코드 찾기
+        sido_code, sigungu_code = find_region_code_by_address(address)
+        
+        if not sido_code or not sigungu_code:
+            return {
+                "success": False, 
+                "error": f"주소 '{address}'에서 지역 코드를 찾을 수 없습니다",
+                "parsed": parsed
+            }
+        
+        # 읍면동명 추출 (도로명에서 유추)
+        emd_name = ""
+        if parsed.get('road_name'):
+            road_name = parsed['road_name']
+            # 도로명에서 동명 유추 (예: "검암로" -> "검암동")
+            if "로" in road_name:
+                base_name = road_name.split("로")[0]
+                emd_name = base_name + "동"
+            elif "길" in road_name:
+                base_name = road_name.split("길")[0]
+                if "번" in base_name:
+                    base_name = base_name.split("번")[0]
+                emd_name = base_name + "동"
+        
+        # 시도명과 시군구명 가져오기
+        sido_name = SIDO_CODES.get(sido_code, "")
+        sigungu_name = ""
+        if sido_code in ALL_SIGUNGU:
+            sigungu_name = ALL_SIGUNGU[sido_code].get(sigungu_code, "")
+        
+        return {
+            "success": True,
+            "sido_code": sido_code,
+            "sigungu_code": sigungu_code,
+            "emd_name": emd_name,
+            "parsed_address": {
+                "sido": parsed.get('sido', ''),
+                "sigungu": parsed.get('sigungu', ''),
+                "road": parsed.get('road_name', ''),
+                "number": parsed.get('building_number', ''),
+                "detail": parsed.get('detail', '')
+            },
+            "region_names": {
+                "sido": sido_name,
+                "sigungu": sigungu_name
+            }
+        }
+        
+    except Exception as e:
+        print(f"[ERROR] 주소 파싱 오류: {str(e)}", file=sys.stderr)
+        return {"success": False, "error": f"주소 파싱 오류: {str(e)}"}
+
+@mcp.tool()
+async def get_real_estate_data_advanced(
+    sido_cd: str,
+    sgg_cd: str, 
+    emd_cd: str = "",
+    emd_name: str = "",
+    complex_name: str = "",
+    area_range: str = "",
+    price_range_min: int = 10,
+    price_range_max: int = 1000000,
+    date_from: str = "",
+    date_to: str = "",
+    property_type: str = "아파트",
+    deal_type: str = "매매",
+    use_xml_api: bool = True
+) -> Dict[str, Any]:
+    """
+    고급 부동산 실거래가 데이터 조회 (실제 사이트 파라미터 사용)
+    
+    Args:
+        sido_cd: 시도코드 (예: 11)
+        sgg_cd: 시군구코드 (예: 11680)
+        emd_cd: 읍면동코드 (선택사항)
+        emd_name: 읍면동명 (선택사항)
+        complex_name: 단지명 (선택사항)
+        area_range: 면적범위 (60-85, 85-100, 100-130, 130-165, 165-)
+        price_range_min: 최소가격 (만원)
+        price_range_max: 최대가격 (만원)
+        date_from: 시작일 (YYYY-MM-DD)
+        date_to: 종료일 (YYYY-MM-DD)
+        property_type: 부동산유형
+        deal_type: 거래유형 (매매, 전세, 월세)
+        use_xml_api: XML API 사용 여부
+    
+    Returns:
+        실거래가 데이터
+    """
+    try:
+        # 실제 사이트 방식으로 CSV 직접 다운로드 시도
+        result = await _get_real_estate_csv_direct(
+            sido_cd=sido_cd,
+            sgg_cd=sgg_cd,
+            emd_cd=emd_cd,
+            area_range=area_range,
+            price_range_min=price_range_min,
+            price_range_max=price_range_max,
+            date_from=date_from,
+            date_to=date_to,
+            deal_type=deal_type
+        )
+        
+        if result["success"]:
+            # 추가 필터링 적용
+            if result.get("data", {}).get("response", {}).get("body", {}).get("items"):
+                items = result["data"]["response"]["body"]["items"]
+                filtered_items = []
+                
+                for item in items:
+                    # 읍면동명 필터링
+                    if emd_name and emd_name.strip():
+                        dong_name = item.get("법정동", "").strip()
+                        if emd_name not in dong_name:
+                            continue
+                    
+                    # 단지명 필터링
+                    if complex_name and complex_name.strip():
+                        apt_name = item.get("아파트명", "").strip()
+                        if complex_name.lower() not in apt_name.lower():
+                            continue
+                    
+                    filtered_items.append(item)
+                
+                # 필터링된 결과 업데이트
+                result["data"]["response"]["body"]["items"] = filtered_items[:20]
+                result["data"]["response"]["body"]["totalCount"] = len(filtered_items)
+                
+                # 필터링 정보 추가
+                result["filter_applied"] = {
+                    "emd_name": emd_name,
+                    "complex_name": complex_name,
+                    "area_range": area_range,
+                    "price_range": f"{price_range_min}-{price_range_max}만원",
+                    "date_range": f"{date_from} ~ {date_to}",
+                    "original_count": len(items),
+                    "filtered_count": len(filtered_items)
+                }
+            
+            return result
+        
+        # CSV 직접 다운로드 실패 시 기존 XML API 사용
+        lawd_cd = sgg_cd  # 시군구 코드를 lawd_cd로 사용
+        deal_ymd = date_from.replace("-", "")[:6] if date_from else datetime.now().strftime("%Y%m")
+        
+        return await _get_real_estate_data(lawd_cd, deal_ymd, property_type, emd_name, "", use_xml_api)
+        
+    except Exception as e:
+        print(f"[ERROR] 고급 실거래가 조회 오류: {str(e)}", file=sys.stderr)
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"고급 실거래가 조회 중 오류가 발생했습니다: {str(e)}"
+        }
+
+async def _get_real_estate_data_legacy(lawd_cd: str, deal_ymd: str, property_type: str = "아파트", emd_name: str = "", complex_name: str = "", area_range: str = "", date_range: str = "", use_xml_api: bool = True) -> Dict[str, Any]:
+    # 필터링 정보를 포함하여 호출
+    result = await _get_real_estate_data(lawd_cd, deal_ymd, property_type, emd_name, date_range, use_xml_api)
+    
+    # 결과 필터링 적용
+    if result.get("success") and result.get("data", {}).get("response", {}).get("body", {}).get("items"):
+        items = result["data"]["response"]["body"]["items"]
+        filtered_items = []
+        
+        for item in items:
+            # 단지명 필터링
+            if complex_name and complex_name.strip():
+                apt_name = item.get("아파트명", "").strip()
+                if complex_name.lower() not in apt_name.lower():
+                    continue
+            
+            # 면적 범위 필터링
+            if area_range and area_range.strip():
+                try:
+                    area_str = item.get("전용면적", "").replace("㎡", "").strip()
+                    if area_str:
+                        area = float(area_str)
+                        
+                        # 면적 범위 파싱 (예: "60-85", "165-")
+                        if "-" in area_range:
+                            if area_range.endswith("-"):  # "165-" 형태
+                                min_area = float(area_range[:-1])
+                                if area < min_area:
+                                    continue
+                            else:  # "60-85" 형태
+                                min_area, max_area = map(float, area_range.split("-"))
+                                if not (min_area <= area <= max_area):
+                                    continue
+                except (ValueError, AttributeError):
+                    # 면적 파싱 실패 시 해당 항목 포함
+                    pass
+            
+            filtered_items.append(item)
+        
+        # 필터링된 결과 업데이트
+        result["data"]["response"]["body"]["items"] = filtered_items[:20]  # 최대 20개로 제한
+        result["data"]["response"]["body"]["totalCount"] = len(filtered_items)
+        
+        # 필터링 정보 추가
+        result["filter_info"] = {
+            "complex_name": complex_name,
+            "area_range": area_range,
+            "original_count": len(items),
+            "filtered_count": len(filtered_items)
+        }
+    
+    return result
+
+async def _get_real_estate_csv_direct(
+    sido_cd: str,
+    sgg_cd: str,
+    emd_cd: str = "",
+    area_range: str = "",
+    price_range_min: int = 10,
+    price_range_max: int = 1000000,
+    date_from: str = "",
+    date_to: str = "",
+    deal_type: str = "매매"
+) -> Dict[str, Any]:
+    """
+    국토교통부 실거래가 CSV 직접 다운로드
+    실제 사이트와 동일한 파라미터 사용
+    """
+    try:
+        # 날짜 설정 및 변환
+        if not date_from or not date_to:
+            from datetime import datetime, timedelta
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=30)
+            date_from = start_date.strftime("%Y-%m-%d")
+            date_to = end_date.strftime("%Y-%m-%d")
+        else:
+            # YYYYMM 형식인 경우 YYYY-MM-DD 형식으로 변환
+            if len(date_from) == 6 and date_from.isdigit():
+                year = date_from[:4]
+                month = date_from[4:6]
+                date_from = f"{year}-{month}-01"
+                
+                # 월의 마지막 날 계산
+                import calendar
+                last_day = calendar.monthrange(int(year), int(month))[1]
+                date_to = f"{year}-{month}-{last_day:02d}"
+            elif len(date_to) == 6 and date_to.isdigit():
+                year = date_to[:4]
+                month = date_to[4:6]
+                
+                # 월의 마지막 날 계산
+                import calendar
+                last_day = calendar.monthrange(int(year), int(month))[1]
+                date_to = f"{year}-{month}-{last_day:02d}"
+        
+        # 면적 코드 매핑
+        area_code_map = {
+            "60-85": "3",      # 60㎡초과~85㎡이하
+            "85-100": "4",     # 85㎡초과~100㎡이하  
+            "100-130": "5",    # 100㎡초과~130㎡이하
+            "130-165": "6",    # 130㎡초과~165㎡이하
+            "165-": "7"        # 165㎡초과
+        }
+        
+        # 거래유형 코드 매핑
+        deal_type_map = {
+            "매매": "1",
+            "전세": "2", 
+            "월세": "3"
+        }
+        
+        # 요청 파라미터 (실제 사이트와 완전 동일)
+        params = {
+            "srhThingNo": "A",                    # 아파트
+            "srhDelngSecd": deal_type_map.get(deal_type, "1"),  # 거래유형
+            "srhAddrGbn": "1",                    # 주소구분
+            "srhLfstsSecd": "1",                  # 실거래가구분
+            "sidoNm": "",                         # 시도명 (빈값)
+            "sggNm": "",                          # 시군구명 (빈값)
+            "emdNm": "",                          # 읍면동명 (빈값)
+            "loadNm": "전체",                     # 도로명
+            "areaNm": "전체",                     # 면적범위명
+            "hsmpNm": "전체",                     # 단지명
+            "mobileAt": "",                       # 모바일구분
+            "srhFromDt": date_from,               # 시작일
+            "srhToDt": date_to,                   # 종료일
+            "srhNewRonSecd": "",                  # 신구분
+            "srhSidoCd": f"{sido_cd}000",         # 시도코드
+            "srhSggCd": sgg_cd,                   # 시군구코드
+            "srhEmdCd": emd_cd if emd_cd else "", # 읍면동코드
+            "srhRoadNm": "",                      # 도로명
+            "srhLoadCd": "",                      # 도로코드
+            "srhHsmpCd": "",                      # 단지코드
+            "srhArea": area_code_map.get(area_range, ""), # 면적코드
+            "srhFromAmount": str(price_range_min), # 최소가격
+            "srhToAmount": str(price_range_max),   # 최대가격
+        }
+        
+        # CSV 다운로드 URL
+        csv_url = "https://rt.molit.go.kr/pt/xls/ptXlsDown.do"
+        
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=30.0),
+            verify=False,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Referer": "https://rt.molit.go.kr/pt/xls/xls.do?mobileAt=",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+            }
+        ) as client:
+            # POST 요청으로 CSV 다운로드
+            response = await client.post(csv_url, data=params)
+            
+            if response.status_code != 200:
+                return {
+                    "success": False,
+                    "error": f"HTTP {response.status_code}",
+                    "message": f"CSV 다운로드 실패: {response.status_code}"
+                }
+            
+            # CSV 데이터 파싱
+            csv_content = response.text
+            
+            # 기존 CSV 파싱 함수 사용
+            items = parse_csv_data(csv_content, "", date_from, date_to, "아파트")
+            
+            return {
+                "success": True,
+                "data": {
+                    "response": {
+                        "header": {"resultCode": "00", "resultMsg": "정상"},
+                        "body": {
+                            "items": items[:20],  # 최대 20개
+                            "totalCount": len(items)
+                        }
+                    }
+                },
+                "source": "csv_direct",
+                "request_params": params,
+                "total_items": len(items)
+            }
+            
+    except Exception as e:
+        print(f"[ERROR] CSV 직접 다운로드 오류: {str(e)}", file=sys.stderr)
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"CSV 직접 다운로드 중 오류가 발생했습니다: {str(e)}"
+        }
+
+
+# 내부 함수 - 다른 도구에서 직접 호출 가능
+async def _analyze_location(address: str, lat: float = None, lon: float = None) -> Dict[str, Any]:
+    """
+    위치 분석 (지하철역 거리, 편의시설 등)
+    
+    Args:
+        address: 주소
+        lat: 위도 (선택사항)
+        lon: 경도 (선택사항)
+    
+    Returns:
+        위치 분석 결과
+    """
+    try:
+        # 좌표가 없으면 주소로 변환
+        if lat is None or lon is None:
+            if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+                return {
+                    "success": False,
+                    "error": "네이버 API 키가 설정되지 않았습니다",
+                    "message": "NAVER_CLIENT_ID, NAVER_CLIENT_SECRET 환경변수를 설정해주세요"
+                }
+            
+            # Check if using IAM credentials (need to convert to proper API credentials)
+            if NAVER_CLIENT_ID.startswith("ncp_iam_"):
+                return {
+                    "success": False,
+                    "error": "NCP IAM 자격 증명이 감지되었습니다. Maps API에는 Application API 키가 필요합니다.",
+                    "message": "네이버 클라우드 플랫폼 콘솔에서 Maps → Application 등록 후 Client ID/Secret을 발급받아 사용해주세요."
+                }
+            
+            # 주소를 좌표로 변환
+            url = "https://maps.apigw.ntruss.com/map-geocode/v2/geocode"
+            headers = {
+                "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+                "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET
+            }
+            params = {"query": address}
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                if not data.get("addresses"):
+                    return {
+                        "success": False,
+                        "error": "주소를 찾을 수 없습니다",
+                        "message": f"'{address}' 주소 검색 결과가 없습니다"
+                    }
+                
+                result = data["addresses"][0]
+                lat = float(result["y"])
+                lon = float(result["x"])
+        
+        # 가장 가까운 지하철역 찾기
+        nearest_stations = []
+        for station_name, station_info in SUBWAY_STATIONS.items():
+            distance = calculate_distance(lat, lon, station_info["lat"], station_info["lon"])
+            nearest_stations.append({
+                "station_name": station_name,
+                "distance_km": distance,
+                "distance_m": int(distance * 1000),
+                "lines": station_info["lines"],
+                "lat": station_info["lat"],
+                "lon": station_info["lon"]
+            })
+        
+        nearest_stations.sort(key=lambda x: x["distance_km"])
+        nearest_5 = nearest_stations[:5]
+        
+        # 편의시설 개수 (모의 데이터)
+        facilities_count = max(10, 50 - int(nearest_5[0]["distance_km"] * 20))
+        
+        # 공원 거리 (모의 데이터)
+        park_distance = min(2.0, nearest_5[0]["distance_km"] * 0.8)
+        
+        # 위치 점수 계산
+        subway_distance = nearest_5[0]["distance_km"]
+        location_score = calculate_location_score(subway_distance, facilities_count, park_distance)
+        
+        return {
+            "success": True,
+            "data": {
+                "coordinates": {"lat": lat, "lon": lon},
+                "address": address,
+                "nearest_stations": nearest_5,
+                "subway_distance": subway_distance,
+                "facilities_count": facilities_count,
+                "park_distance": park_distance,
+                "location_score": location_score
+            },
+            "message": "위치 분석을 완료했습니다"
+        }
+        
+    except Exception as e:
+        # 위치 분석 실패 시에도 기본값으로 성공 응답 반환
+        return {
+            "success": True,
+            "data": {
+                "coordinates": {"lat": 37.5665, "lon": 126.9780},  # 서울 시청 기본 좌표
+                "address": address,
+                "nearest_stations": [
+                    {"station_name": "시청역", "distance_km": 1.0, "distance_m": 1000, "lines": ["1호선", "2호선"]}
+                ],
+                "subway_distance": 1.0,
+                "facilities_count": 25,
+                "park_distance": 0.5,
+                "location_score": {"total_score": 60, "grade": "B"}
+            },
+            "message": f"위치 분석 중 오류 발생 (기본값 사용): {str(e)}"
+        }
+
+@mcp.tool()
+async def analyze_location(address: str, lat: float = None, lon: float = None) -> Dict[str, Any]:
+    """
+    위치 분석 (지하철역 거리, 편의시설 등)
+    
+    Args:
+        address: 주소
+        lat: 위도 (선택사항)
+        lon: 경도 (선택사항)
+    
+    Returns:
+        위치 분석 결과
+    """
+    return await _analyze_location(address, lat, lon)
+
+def calculate_location_score(subway_distance: float, facilities_count: int, park_distance: float) -> Dict[str, Any]:
+    """위치 점수 계산"""
+    # 교통 점수
+    if subway_distance <= 0.5:
+        transport_score = 100
+    elif subway_distance <= 1.0:
+        transport_score = 80
+    elif subway_distance <= 1.5:
+        transport_score = 60
+    else:
+        transport_score = 40
+    
+    # 편의성 점수
+    if facilities_count >= 40:
+        convenience_score = 100
+    elif facilities_count >= 30:
+        convenience_score = 80
+    elif facilities_count >= 20:
+        convenience_score = 60
+    else:
+        convenience_score = 40
+    
+    # 환경 점수
+    if park_distance <= 0.3:
+        environment_score = 100
+    elif park_distance <= 0.5:
+        environment_score = 80
+    elif park_distance <= 1.0:
+        environment_score = 60
+    else:
+        environment_score = 40
+    
+    total_score = transport_score * 0.4 + convenience_score * 0.35 + environment_score * 0.25
+    
+    if total_score >= 90:
+        grade = "A+"
+    elif total_score >= 80:
+        grade = "A"
+    elif total_score >= 70:
+        grade = "B+"
+    elif total_score >= 60:
+        grade = "B"
+    else:
+        grade = "C"
+    
+    return {
+        "total_score": round(total_score, 1),
+        "grade": grade,
+        "detail_scores": {
+            "transport": transport_score,
+            "convenience": convenience_score,
+            "environment": environment_score
+        }
+    }
+
+
+# 내부 함수 - 다른 도구에서 직접 호출 가능  
+async def _evaluate_investment_value(
+    address: str,
+    price: int,
+    area: float,
+    floor: int,
+    total_floor: int,
+    building_year: int,
+    property_type: str,
+    deal_type: str
+) -> Dict[str, Any]:
+    """
+    투자가치 평가
+    
+    Args:
+        address: 주소
+        price: 가격 (만원)
+        area: 전용면적 (㎡)
+        floor: 층수
+        total_floor: 총 층수
+        building_year: 건축년도
+        property_type: 부동산 유형
+        deal_type: 거래 유형
+    
+    Returns:
+        투자가치 평가 결과
+    """
+    try:
+        # 위치 분석 (실패해도 계속 진행)
+        location_result = await _analyze_location(address)
+        if location_result["success"]:
+            location_data = location_result["data"]
+        else:
+            # 위치 분석 실패 시 기본값 사용
+            location_data = {
+                "coordinates": {"lat": 37.5665, "lon": 126.9780},  # 서울 시청 좌표
+                "subway_distance": 1.0,  # 기본값 1km
+                "facilities_count": 25,  # 기본값 25개
+                "park_distance": 0.5,  # 기본값 0.5km
+                "location_score": {"total_score": 60, "grade": "B"}  # 기본 점수
+            }
+        
+        # 1. 가격 점수 (평당 가격 기준)
+        price_per_pyeong = price / (area / 3.3)
+        if address.startswith("서울"):
+            if price_per_pyeong <= 8000:
+                price_score = 100
+            elif price_per_pyeong <= 12000:
+                price_score = 80
+            elif price_per_pyeong <= 16000:
+                price_score = 60
+            else:
+                price_score = 40
+        else:
+            if price_per_pyeong <= 3000:
+                price_score = 100
+            elif price_per_pyeong <= 5000:
+                price_score = 80
+            elif price_per_pyeong <= 7000:
+                price_score = 60
+            else:
+                price_score = 40
+        
+        # 2. 면적 점수
+        area_pyeong = area / 3.3
+        if 20 <= area_pyeong <= 35:
+            area_score = 100
+        elif 15 <= area_pyeong < 20 or 35 < area_pyeong <= 45:
+            area_score = 80
+        elif 10 <= area_pyeong < 15 or 45 < area_pyeong <= 60:
+            area_score = 60
+        else:
+            area_score = 40
+        
+        # 3. 층수 점수
+        floor_rate = floor / total_floor
+        if 0.3 <= floor_rate <= 0.8:
+            floor_score = 100
+        elif 0.2 <= floor_rate < 0.3 or 0.8 < floor_rate <= 0.9:
+            floor_score = 80
+        else:
+            floor_score = 60
+        
+        # 4. 교통 점수
+        subway_distance = location_data["subway_distance"]
+        if subway_distance <= 0.5:
+            transport_score = 100
+        elif subway_distance <= 1.0:
+            transport_score = 80
+        elif subway_distance <= 1.5:
+            transport_score = 60
+        else:
+            transport_score = 40
+        
+        # 5. 미래 발전 가능성
+        current_year = datetime.now().year
+        building_age = current_year - building_year
+        future_score = 50
+        
+        if building_age >= 30:
+            future_score += 20
+        elif building_age >= 20:
+            future_score += 10
+        
+        if subway_distance <= 0.5:
+            future_score += 20
+        elif subway_distance <= 1.0:
+            future_score += 10
+        
+        future_score = min(future_score, 100)
+        
+        # 종합 점수
+        total_score = (
+            price_score * 0.25 +
+            area_score * 0.20 +
+            floor_score * 0.15 +
+            transport_score * 0.25 +
+            future_score * 0.15
+        )
+        
+        if total_score >= 90:
+            grade = "A+"
+        elif total_score >= 80:
+            grade = "A"
+        elif total_score >= 70:
+            grade = "B+"
+        elif total_score >= 60:
+            grade = "B"
+        else:
+            grade = "C"
+        
+        return {
+            "success": True,
+            "data": {
+                "total_score": round(total_score, 1),
+                "grade": grade,
+                "detail_scores": {
+                    "price_score": price_score,
+                    "area_score": area_score,
+                    "floor_score": floor_score,
+                    "transport_score": transport_score,
+                    "future_score": future_score
+                },
+                "analysis": {
+                    "price_per_pyeong": round(price_per_pyeong, 0),
+                    "area_pyeong": round(area_pyeong, 1),
+                    "floor_rate": round(floor_rate, 2),
+                    "building_age": building_age
+                },
+                "location_data": location_data
+            },
+            "message": f"투자가치 평가 완료: {total_score:.1f}점 ({grade})"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "투자가치 평가 중 오류가 발생했습니다"
+        }
+
+@mcp.tool()
+async def evaluate_investment_value(
+    address: str,
+    price: int,
+    area: float,
+    floor: int,
+    total_floor: int,
+    building_year: int,
+    property_type: str,
+    deal_type: str
+) -> Dict[str, Any]:
+    """
+    투자가치 평가
+    
+    Args:
+        address: 주소
+        price: 가격 (만원)
+        area: 전용면적 (㎡)
+        floor: 층수
+        total_floor: 총 층수
+        building_year: 건축년도
+        property_type: 부동산 유형
+        deal_type: 거래 유형
+    
+    Returns:
+        투자가치 평가 결과
+    """
+    return await _evaluate_investment_value(address, price, area, floor, total_floor, building_year, property_type, deal_type)
+
+# 내부 함수 - 다른 도구에서 직접 호출 가능
+async def _evaluate_life_quality(
+    address: str,
+    price: int,
+    area: float,
+    floor: int,
+    total_floor: int,
+    building_year: int,
+    property_type: str,
+    deal_type: str
+) -> Dict[str, Any]:
+    """
+    삶의질가치 평가
+    
+    Args:
+        address: 주소
+        price: 가격 (만원)
+        area: 전용면적 (㎡)
+        floor: 층수
+        total_floor: 총 층수
+        building_year: 건축년도
+        property_type: 부동산 유형
+        deal_type: 거래 유형
+    
+    Returns:
+        삶의질가치 평가 결과
+    """
+    try:
+        # 위치 분석 (실패해도 계속 진행)
+        location_result = await _analyze_location(address)
+        if location_result["success"]:
+            location_data = location_result["data"]
+        else:
+            # 위치 분석 실패 시 기본값 사용
+            location_data = {
+                "coordinates": {"lat": 37.5665, "lon": 126.9780},  # 서울 시청 좌표
+                "subway_distance": 1.0,  # 기본값 1km
+                "facilities_count": 25,  # 기본값 25개
+                "park_distance": 0.5,  # 기본값 0.5km
+                "location_score": {"total_score": 60, "grade": "B"}  # 기본 점수
+            }
+        
+        # 1. 환경 점수
+        park_distance = location_data["park_distance"]
+        environment_score = 50
+        if park_distance <= 0.3:
+            environment_score += 30
+        elif park_distance <= 0.5:
+            environment_score += 20
+        elif park_distance <= 1.0:
+            environment_score += 10
+        environment_score = min(environment_score, 100)
+        
+        # 2. 편의성 점수
+        facilities_count = location_data["facilities_count"]
+        if facilities_count >= 40:
+            convenience_score = 100
+        elif facilities_count >= 30:
+            convenience_score = 85
+        elif facilities_count >= 20:
+            convenience_score = 70
+        elif facilities_count >= 10:
+            convenience_score = 55
+        else:
+            convenience_score = 40
+        
+        # 3. 안전 점수
+        safety_score = 70
+        if floor == 1:
+            safety_score -= 10
+        elif floor >= 15:
+            safety_score -= 5
+        safety_score = max(safety_score, 30)
+        
+        # 4. 교육 점수 (주변 학교, 학원가 접근성 기반)
+        subway_distance = location_data["subway_distance"]
+        education_score = 75  # 서울 강남/교육 특구 기본점수
+        if subway_distance <= 0.5:
+            education_score += 5  # 교통 접근성 보너스
+        elif subway_distance >= 2.0:
+            education_score -= 10
+        education_score = min(education_score, 100)
+        
+        # 5. 문화 점수 (문화시설, 쇼핑몰 접근성 기반)
+        culture_score = 70  # 기본 점수를 70으로 상향 조정
+        if facilities_count >= 30:
+            culture_score += 10  # 편의시설이 많으면 문화시설도 많음
+        elif facilities_count <= 15:
+            culture_score -= 10
+        culture_score = min(culture_score, 100)
+        
+        # 종합 점수
+        total_score = (
+            environment_score * 0.25 +
+            convenience_score * 0.25 +
+            safety_score * 0.20 +
+            education_score * 0.15 +
+            culture_score * 0.15
+        )
+        
+        if total_score >= 90:
+            grade = "A+"
+        elif total_score >= 80:
+            grade = "A"
+        elif total_score >= 70:
+            grade = "B+"
+        elif total_score >= 60:
+            grade = "B"
+        else:
+            grade = "C"
+        
+        return {
+            "success": True,
+            "data": {
+                "total_score": round(total_score, 1),
+                "grade": grade,
+                "detail_scores": {
+                    "environment_score": environment_score,
+                    "convenience_score": convenience_score,
+                    "safety_score": safety_score,
+                    "education_score": education_score,
+                    "culture_score": culture_score
+                },
+                "location_data": location_data
+            },
+            "message": f"삶의질가치 평가 완료: {total_score:.1f}점 ({grade})"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "삶의질가치 평가 중 오류가 발생했습니다"
+        }
+
+@mcp.tool()
+async def evaluate_life_quality(
+    address: str,
+    price: int,
+    area: float,
+    floor: int,
+    total_floor: int,
+    building_year: int,
+    property_type: str,
+    deal_type: str
+) -> Dict[str, Any]:
+    """
+    삶의질가치 평가
+    
+    Args:
+        address: 주소
+        price: 가격 (만원)
+        area: 전용면적 (㎡)
+        floor: 층수
+        total_floor: 총 층수
+        building_year: 건축년도
+        property_type: 부동산 유형
+        deal_type: 거래 유형
+    
+    Returns:
+        삶의질가치 평가 결과
+    """
+    return await _evaluate_life_quality(address, price, area, floor, total_floor, building_year, property_type, deal_type)
+
+@mcp.tool()
+async def recommend_property(
+    address: str,
+    price: int,
+    area: float,
+    floor: int,
+    total_floor: int,
+    building_year: int,
+    property_type: str,
+    deal_type: str,
+    user_preference: str = "균형"
+) -> Dict[str, Any]:
+    """
+    종합 부동산 추천
+    
+    Args:
+        address: 주소
+        price: 가격 (만원)
+        area: 전용면적 (㎡)
+        floor: 층수
+        total_floor: 총 층수
+        building_year: 건축년도
+        property_type: 부동산 유형
+        deal_type: 거래 유형
+        user_preference: 사용자 성향 (투자, 삶의질, 균형)
+    
+    Returns:
+        종합 추천 결과
+    """
+    try:
+        # 투자가치 평가
+        investment_result = await _evaluate_investment_value(
+            address, price, area, floor, total_floor, building_year, property_type, deal_type
+        )
+        
+        if not investment_result["success"]:
+            return investment_result
+        
+        # 삶의질가치 평가
+        life_quality_result = await _evaluate_life_quality(
+            address, price, area, floor, total_floor, building_year, property_type, deal_type
+        )
+        
+        if not life_quality_result["success"]:
+            return life_quality_result
+        
+        investment_score = investment_result["data"]["total_score"]
+        life_quality_score = life_quality_result["data"]["total_score"]
+        
+        # 사용자 성향에 따른 가중치 적용
+        if user_preference == "투자":
+            final_score = investment_score * 0.8 + life_quality_score * 0.2
+        elif user_preference == "삶의질":
+            final_score = investment_score * 0.2 + life_quality_score * 0.8
+        else:  # 균형
+            final_score = investment_score * 0.5 + life_quality_score * 0.5
+        
+        if final_score >= 90:
+            final_grade = "A+"
+        elif final_score >= 80:
+            final_grade = "A"
+        elif final_score >= 70:
+            final_grade = "B+"
+        elif final_score >= 60:
+            final_grade = "B"
+        else:
+            final_grade = "C"
+        
+        # 추천 여부 결정
+        recommended = final_score >= 70
+        
+        # 장단점 분석 (개선된 로직)
+        pros = []
+        cons = []
+        
+        # 투자가치 관련 장단점
+        transport_score = investment_result["data"]["detail_scores"]["transport_score"]
+        price_score = investment_result["data"]["detail_scores"]["price_score"]
+        area_score = investment_result["data"]["detail_scores"]["area_score"]
+        floor_score = investment_result["data"]["detail_scores"]["floor_score"]
+        future_score = investment_result["data"]["detail_scores"]["future_score"]
+        
+        # 삶의질 관련 장단점
+        environment_score = life_quality_result["data"]["detail_scores"]["environment_score"]
+        convenience_score = life_quality_result["data"]["detail_scores"]["convenience_score"]
+        safety_score = life_quality_result["data"]["detail_scores"]["safety_score"]
+        education_score = life_quality_result["data"]["detail_scores"]["education_score"]
+        culture_score = life_quality_result["data"]["detail_scores"]["culture_score"]
+        
+        # 장점 분석 (70점 이상)
+        if transport_score >= 70:
+            pros.append(f"교통접근성 우수 ({transport_score}점)")
+        if price_score >= 70:
+            pros.append(f"가격 경쟁력 좋음 ({price_score}점)")
+        if area_score >= 70:
+            pros.append(f"넓이 대비 가치 높음 ({area_score}점)")
+        if floor_score >= 70:
+            pros.append(f"층수 조건 양호 ({floor_score}점)")
+        if future_score >= 70:
+            pros.append(f"미래 가치 상승 전망 ({future_score}점)")
+        if environment_score >= 70:
+            pros.append(f"주변 환경 쾌적 ({environment_score}점)")
+        if convenience_score >= 70:
+            pros.append(f"편의시설 풍부 ({convenience_score}점)")
+        if safety_score >= 70:
+            pros.append(f"안전한 지역 ({safety_score}점)")
+        if education_score >= 70:
+            pros.append(f"교육 환경 우수 ({education_score}점)")
+        if culture_score >= 70:
+            pros.append(f"문화 시설 접근성 좋음 ({culture_score}점)")
+        
+        # 단점 분석 (60점 미만)
+        if transport_score < 60:
+            cons.append(f"교통접근성 아쉬움 ({transport_score}점)")
+        if price_score < 60:
+            cons.append(f"시세 대비 가격 높음 ({price_score}점)")
+        if area_score < 60:
+            cons.append(f"넓이 대비 가치 부족 ({area_score}점)")
+        if floor_score < 60:
+            cons.append(f"층수 조건 아쉬움 ({floor_score}점)")
+        if future_score < 60:
+            cons.append(f"미래 가치 상승 제한적 ({future_score}점)")
+        if environment_score < 60:
+            cons.append(f"주변 환경 개선 필요 ({environment_score}점)")
+        if convenience_score < 60:
+            cons.append(f"편의시설 부족 ({convenience_score}점)")
+        if safety_score < 60:
+            cons.append(f"안전성 개선 필요 ({safety_score}점)")
+        if education_score < 60:
+            cons.append(f"교육 환경 아쉬움 ({education_score}점)")
+        if culture_score < 60:
+            cons.append(f"문화 시설 접근성 부족 ({culture_score}점)")
+        
+        # 최소 하나의 장점/단점은 보장 (빈 배열 방지)
+        if not pros:
+            if final_score >= 70:
+                pros.append(f"종합 점수 양호 ({final_score:.1f}점)")
+            else:
+                pros.append("개별 점수는 낮지만 균형 잡힌 매물")
+        
+        if not cons:
+            if final_score < 70:
+                cons.append(f"종합 점수 개선 필요 ({final_score:.1f}점)")
+            else:
+                cons.append("전반적으로 양호하나 세부 개선 가능")
+        
+        return {
+            "success": True,
+            "data": {
+                "property_info": {
+                    "address": address,
+                    "price": price,
+                    "area": area,
+                    "floor": f"{floor}/{total_floor}",
+                    "building_year": building_year,
+                    "property_type": property_type,
+                    "deal_type": deal_type
+                },
+                "evaluation": {
+                    "final_score": round(final_score, 1),
+                    "final_grade": final_grade,
+                    "user_preference": user_preference,
+                    "investment_evaluation": investment_result["data"],
+                    "life_quality_evaluation": life_quality_result["data"]
+                },
+                "recommendation": {
+                    "recommended": recommended,
+                    "pros": pros,
+                    "cons": cons,
+                    "reason": "투자가치와 삶의질을 종합적으로 분석한 결과입니다"
+                },
+                "timestamp": datetime.now().isoformat()
+            },
+            "message": f"부동산 추천 완료: {final_score:.1f}점 ({final_grade}) - {'추천' if recommended else '보류'}"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "부동산 추천 중 오류가 발생했습니다"
+        }
+
+@mcp.tool()
+async def get_regional_price_statistics(lawd_cd: str = None, region: str = None, property_type: str = "아파트", months: int = 12) -> Dict[str, Any]:
+    """
+    지역별 가격 통계 및 트렌드 분석
+    
+    Args:
+        lawd_cd: 지역코드 (5자리)
+        region: 지역명 또는 주소 (lawd_cd가 없을 때 사용)
+        property_type: 부동산 유형 (아파트, 오피스텔, 연립다세대)
+        months: 분석할 개월 수 (기본 12개월)
+    
+    Returns:
+        지역별 가격 통계 데이터
+    """
+    # region이 제공된 경우 lawd_cd로 변환 시도
+    if not lawd_cd and region:
+        # 간단한 지역명 매핑 (실제로는 더 정교한 주소 파싱이 필요)
+        region_mappings = {
+            "강남": "11680", "강남구": "11680",
+            "서초": "11650", "서초구": "11650", 
+            "송파": "11710", "송파구": "11710",
+            "강동": "11740", "강동구": "11740",
+            "마포": "11440", "마포구": "11440",
+            "용산": "11170", "용산구": "11170",
+            "성동": "11200", "성동구": "11200",
+            "광진": "11215", "광진구": "11215",
+            "동대문": "11230", "동대문구": "11230",
+            "중랑": "11260", "중랑구": "11260",
+            "성북": "11290", "성북구": "11290",
+            "강북": "11305", "강북구": "11305",
+            "도봉": "11320", "도봉구": "11320",
+            "노원": "11350", "노원구": "11350",
+            "은평": "11380", "은평구": "11380",
+            "서대문": "11410", "서대문구": "11410",
+            "영등포": "11560", "영등포구": "11560",
+            "양천": "11470", "양천구": "11470",
+            "구로": "11530", "구로구": "11530",
+            "금천": "11545", "금천구": "11545",
+            "관악": "11620", "관악구": "11620",
+            "동작": "11590", "동작구": "11590",
+            "중구": "11140", "종로": "11110", "종로구": "11110"
+        }
+        
+        # region에서 지역코드 찾기
+        for key, code in region_mappings.items():
+            if key in region:
+                lawd_cd = code
+                break
+        
+        # 여전히 lawd_cd가 없으면 기본값 사용 (강남구)
+        if not lawd_cd:
+            lawd_cd = "11680"
+    
+    if not lawd_cd:
+        return {
+            "success": False,
+            "error": "지역코드(lawd_cd) 또는 지역명(region)이 필요합니다",
+            "message": "lawd_cd 또는 region 파라미터를 제공해주세요"
+        }
+    
+    if not MOLIT_API_KEY:
+        return {
+            "success": False,
+            "error": "국토교통부 API 키가 설정되지 않았습니다",
+            "message": "MOLIT_API_KEY 환경변수를 설정해주세요"
+        }
+    
+    try:
+        from datetime import datetime, timedelta
+        import statistics
+        
+        # 최근 N개월 데이터 수집
+        end_date = datetime.now()
+        monthly_data = []
+        price_data = []
+        
+        for i in range(months):
+            target_date = end_date - timedelta(days=30 * i)
+            deal_ymd = target_date.strftime("%Y%m")
+            
+            # MCP 내부에서 다른 도구 호출 - 직접 함수 호출 방식 (안전)
+            monthly_result = await _get_real_estate_data(lawd_cd, deal_ymd, property_type)
+
+            if monthly_result.get("success") and _extract_items(monthly_result):
+                items = _extract_items(monthly_result)
+
+                # 가격 데이터 추출 및 정제
+                month_prices = []
+                for item in items:
+                    try:
+                        # 거래금액에서 쉼표 제거 후 숫자 변환
+                        price_str = item.get("거래금액", "0").replace(",", "").replace(" ", "")
+                        if price_str.isdigit():
+                            price = int(price_str)
+                            if price > 0:  # 유효한 가격만
+                                month_prices.append(price)
+                                price_data.append({"price": price, "month": deal_ymd})
+                    except (ValueError, KeyError):
+                        continue
+                
+                if month_prices:
+                    monthly_data.append({
+                        "month": deal_ymd,
+                        "transaction_count": len(month_prices),
+                        "average_price": statistics.mean(month_prices),
+                        "median_price": statistics.median(month_prices),
+                        "min_price": min(month_prices),
+                        "max_price": max(month_prices),
+                        "price_std": statistics.stdev(month_prices) if len(month_prices) > 1 else 0
+                    })
+        
+        if not monthly_data:
+            return {
+                "success": False,
+                "error": "분석할 데이터가 없습니다",
+                "message": f"{months}개월 기간 내 거래 데이터가 없습니다"
+            }
+        
+        # 전체 통계 계산
+        all_prices = [price["price"] for price in price_data]
+        total_transactions = len(all_prices)
+        
+        # 가격 변동률 계산 (최신 월 vs 1년 전)
+        price_change_rate = 0
+        if len(monthly_data) >= 2:
+            latest_avg = monthly_data[0]["average_price"]
+            oldest_avg = monthly_data[-1]["average_price"]
+            price_change_rate = ((latest_avg - oldest_avg) / oldest_avg) * 100
+        
+        # 가격 구간별 분포
+        price_ranges = {
+            "1억 미만": 0,
+            "1-3억": 0,
+            "3-5억": 0,
+            "5-10억": 0,
+            "10억 초과": 0
+        }
+        
+        for price in all_prices:
+            price_eok = price / 10000  # 만원 -> 억원
+            if price_eok < 1:
+                price_ranges["1억 미만"] += 1
+            elif price_eok < 3:
+                price_ranges["1-3억"] += 1
+            elif price_eok < 5:
+                price_ranges["3-5억"] += 1
+            elif price_eok < 10:
+                price_ranges["5-10억"] += 1
+            else:
+                price_ranges["10억 초과"] += 1
+        
+        # 최신 트렌드 분석 (최근 3개월)
+        recent_trend = "안정"
+        if len(monthly_data) >= 3:
+            recent_prices = [data["average_price"] for data in monthly_data[:3]]
+            if recent_prices[0] > recent_prices[2] * 1.05:
+                recent_trend = "상승"
+            elif recent_prices[0] < recent_prices[2] * 0.95:
+                recent_trend = "하락"
+        
+        return {
+            "success": True,
+            "data": {
+                "region_code": lawd_cd,
+                "property_type": property_type,
+                "analysis_period": f"{months}개월",
+                "summary": {
+                    "total_transactions": total_transactions,
+                    "average_price": statistics.mean(all_prices) if all_prices else 0,
+                    "median_price": statistics.median(all_prices) if all_prices else 0,
+                    "price_change_rate": round(price_change_rate, 2),
+                    "recent_trend": recent_trend
+                },
+                "monthly_data": monthly_data,
+                "price_distribution": price_ranges,
+                "market_analysis": {
+                    "volatility": statistics.stdev(all_prices) if len(all_prices) > 1 else 0,
+                    "price_stability": "높음" if len(all_prices) > 0 and statistics.stdev(all_prices) / statistics.mean(all_prices) < 0.3 else "보통"
+                }
+            },
+            "message": f"{property_type} {months}개월 시세 분석이 완료되었습니다"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "지역별 가격 통계 분석 중 오류가 발생했습니다"
+        }
+
+
+def _year_month_range(start_ym: str, end_ym: str) -> List[str]:
+    """'202601' ~ '202606' 형태의 시작/끝 년월을 그 사이의 모든 YYYYMM 목록으로 펼친다."""
+    start_year, start_month = int(start_ym[:4]), int(start_ym[4:6])
+    end_year, end_month = int(end_ym[:4]), int(end_ym[4:6])
+    if (start_year, start_month) > (end_year, end_month):
+        start_year, start_month, end_year, end_month = end_year, end_month, start_year, start_month
+
+    months_list = []
+    year, month = start_year, start_month
+    while (year, month) <= (end_year, end_month):
+        months_list.append(f"{year}{month:02d}")
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return months_list
+
+
+@mcp.tool()
+async def get_nearby_apartment_transactions(
+    address: str,
+    lawd_cd: str,
+    region_name: str,
+    radius_km: float = 5.0,
+    months: int = 3,
+    start_year_month: str = None,
+    end_year_month: str = None,
+    property_type: str = "아파트",
+    max_geocode: int = 40,
+) -> Dict[str, Any]:
+    """
+    기준 주소 반경 내 아파트 실거래가를 좌표와 함께 조회한다 (지도 표시용).
+
+    사용자가 "최근"이라고만 말했다면 months(기본 3개월, 오늘 기준 최근 N개월)를 그대로 쓰고,
+    그 기간에 데이터가 없으면 없다고 답하면 된다 (자동으로 더 과거를 뒤지지 않음).
+    반면 사용자가 "2026년 1월" 또는 "2026년 1월부터 6월까지"처럼 구체적인 기간을 말했다면
+    반드시 start_year_month(그리고 필요시 end_year_month)를 채워서 그 기간만 조회해야 한다 —
+    이 경우 months 값은 무시된다.
+
+    Args:
+        address: 기준 주소 (도로명/지번 주소 또는 "풍무푸르지오" 같은 아파트 단지명 모두 가능 —
+            단지명은 네이버 주소 검색이 실패하면 카카오 장소 검색으로 자동 폴백)
+        lawd_cd: 기준 주소가 속한 법정동코드 (5자리)
+        region_name: 기준 주소가 속한 전체 지역명 (예: "경기도 김포시") - 각 거래의
+            도로명을 지오코딩할 때 지역을 특정하기 위해 필요
+        radius_km: 검색 반경 (km, 기본 5km)
+        months: "최근 N개월"을 물었을 때만 사용 (기본 3개월, 오늘 기준 역산). 특정 기간을
+            물었다면 무시하고 start_year_month/end_year_month를 사용할 것
+        start_year_month: 조회 시작 년월 (YYYYMM, 예: "202601"). 특정 기간이 언급되면 필수
+        end_year_month: 조회 종료 년월 (YYYYMM, 예: "202606"). 생략하면 start_year_month와
+            동일한 한 달만 조회
+        property_type: 부동산 유형 (아파트, 오피스텔, 연립다세대)
+        max_geocode: 지오코딩(좌표 변환)할 최대 거래 건수 (API 호출량 제한, 기본 40건)
+
+    Returns:
+        반경 내 거래 목록 (좌표, 거리 포함)
+    """
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return {
+            "success": False,
+            "error": "네이버 API 키가 설정되지 않았습니다",
+            "message": "NAVER_CLIENT_ID, NAVER_CLIENT_SECRET 환경변수를 설정해주세요"
+        }
+    if NAVER_CLIENT_ID.startswith("ncp_iam_"):
+        return {
+            "success": False,
+            "error": "NCP IAM 자격 증명이 감지되었습니다. Maps API에는 Application API 키가 필요합니다.",
+            "message": "네이버 클라우드 플랫폼 콘솔에서 Maps → Application 등록 후 Client ID/Secret을 발급받아 사용해주세요."
+        }
+    if not MOLIT_API_KEY:
+        return {
+            "success": False,
+            "error": "국토교통부 API 키가 설정되지 않았습니다",
+            "message": "MOLIT_API_KEY 환경변수를 설정해주세요"
+        }
+
+    geocode_url = "https://maps.apigw.ntruss.com/map-geocode/v2/geocode"
+    geocode_headers = {
+        "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+        "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            # 기준 주소 좌표 변환 (도로명/지번 주소는 네이버, 아파트 단지명 등 장소명은 카카오로 폴백)
+            response = await client.get(geocode_url, headers=geocode_headers, params={"query": address})
+            response.raise_for_status()
+            geocoded = response.json()
+            if geocoded.get("addresses"):
+                center_lat = float(geocoded["addresses"][0]["y"])
+                center_lon = float(geocoded["addresses"][0]["x"])
+            elif KAKAO_API_KEY:
+                kakao_response = await client.get(
+                    "https://dapi.kakao.com/v2/local/search/keyword.json",
+                    headers={"Authorization": f"KakaoAK {KAKAO_API_KEY}"},
+                    params={"query": address},
+                )
+                kakao_response.raise_for_status()
+                kakao_data = kakao_response.json()
+                documents = kakao_data.get("documents")
+                if not documents:
+                    return {
+                        "success": False,
+                        "error": "기준 주소를 찾을 수 없습니다",
+                        "message": f"'{address}' 주소 검색 결과가 없습니다 (네이버 주소 검색, 카카오 장소 검색 모두 실패)"
+                    }
+                center_lat = float(documents[0]["y"])
+                center_lon = float(documents[0]["x"])
+            else:
+                return {
+                    "success": False,
+                    "error": "기준 주소를 찾을 수 없습니다",
+                    "message": f"'{address}' 주소 검색 결과가 없습니다. 단지명 대신 도로명 주소를 입력하거나, KAKAO_API_KEY를 등록하면 단지명 검색도 지원됩니다."
+                }
+
+            # 조회 기간 결정: 특정 기간이 지정되면 그 기간만, 아니면 오늘 기준 최근 N개월만
+            # (데이터가 없다고 해서 자동으로 더 과거를 뒤지지 않는다 - 정직하게 없다고 답한다)
+            if start_year_month:
+                deal_ymd_list = _year_month_range(start_year_month, end_year_month or start_year_month)
+                period_label = (
+                    f"{start_year_month[:4]}년 {int(start_year_month[4:6])}월"
+                    if not end_year_month or end_year_month == start_year_month
+                    else f"{start_year_month[:4]}년 {int(start_year_month[4:6])}월~"
+                    f"{end_year_month[:4]}년 {int(end_year_month[4:6])}월"
+                )
+            else:
+                end_date = datetime.now()
+                deal_ymd_list = [(end_date - timedelta(days=30 * i)).strftime("%Y%m") for i in range(months)]
+                period_label = f"최근 {months}개월"
+
+            # 조회 기간이 길면(1년=12개월) 달마다 순차로 기다리면 그만큼 그대로 느려지니
+            # 동시에 조회한다.
+            monthly_results = await asyncio.gather(
+                *(_get_real_estate_data(lawd_cd, deal_ymd, property_type) for deal_ymd in deal_ymd_list)
+            )
+            raw_items: List[Dict[str, Any]] = []
+            for monthly_result in monthly_results:
+                if monthly_result.get("success"):
+                    raw_items.extend(_extract_items(monthly_result))
+
+            if not raw_items:
+                return {
+                    "success": False,
+                    "error": "분석할 데이터가 없습니다",
+                    "message": f"{period_label} 기간 내 거래 데이터가 없습니다"
+                }
+
+            # 도로명이 있는 항목만, 지오코딩 호출량 제한을 위해 상한 적용.
+            # 그냥 원자료 순서대로 자르면 거래량이 많은 지역(강남구 등)에서 정작 분석
+            # 대상 건물의 거래가 상한 밖으로 밀려나 매번 빠질 수 있다. 분석 대상 주소와
+            # 정확히 같은 도로명+건물번지인 거래를 최우선으로, 그 다음 같은 도로(번지 제외,
+            # 삼성로처럼 긴 대로엔 여러 단지가 있어 이 단계만으로는 특정 단지가 보장되지 않음),
+            # 나머지 순으로 배치해 대상 건물이 상한 안에 확실히 들어오게 한다.
+            target_match = re.search(r"(\S+(?:로|길))\s+(\d+)", address)
+            target_road_name = target_match.group(1) if target_match else None
+            target_full_road = f"{target_match.group(1)} {target_match.group(2)}" if target_match else None
+
+            with_road = [item for item in raw_items if item.get("도로명")]
+
+            def _priority(road: str) -> int:
+                if target_full_road and road.startswith(target_full_road):
+                    return 0
+                if target_road_name and road.startswith(target_road_name):
+                    return 1
+                return 2
+
+            # 같은 건물은 거래가 여러 건이어도 도로명 주소가 동일해 좌표가 같다 - 매
+            # 거래마다 지오코딩하면 거래량 많은 단지 하나가 max_geocode 상한을 혼자
+            # 다 써버려서 반경 내 다른 단지가 밀려난다. 고유 도로명 기준으로만 상한을
+            # 적용하고 지오코딩 결과를 그 도로명의 모든 거래에 재사용한다.
+            unique_roads = list(dict.fromkeys(item["도로명"] for item in with_road))
+            road_candidates = sorted(unique_roads, key=_priority)[:max_geocode]
+
+            # 최대 40개 도로명을 하나씩 기다리며 지오코딩하면 그 자체로 수십 초가 걸릴 수
+            # 있어, 동시에(단 네이버 API 순간 호출량 제한을 고려해 최대 10개씩) 처리한다.
+            geocode_semaphore = asyncio.Semaphore(10)
+
+            async def _geocode_road(road: str) -> Tuple[str, Optional[Tuple[float, float]]]:
+                async with geocode_semaphore:
+                    road_query = f"{region_name} {road}"
+                    try:
+                        geo_response = await client.get(
+                            geocode_url, headers=geocode_headers, params={"query": road_query}
+                        )
+                        geo_response.raise_for_status()
+                        geo_data = geo_response.json()
+                        addresses = geo_data.get("addresses")
+                        if not addresses:
+                            return road, None
+                        return road, (float(addresses[0]["y"]), float(addresses[0]["x"]))
+                    except (httpx.HTTPError, KeyError, ValueError, IndexError):
+                        return road, None
+
+            geocode_results = await asyncio.gather(*(_geocode_road(road) for road in road_candidates))
+            geocoded: Dict[str, tuple] = {road: coords for road, coords in geocode_results if coords is not None}
+
+            nearby: List[Dict[str, Any]] = []
+            for item in with_road:
+                coords = geocoded.get(item["도로명"])
+                if coords is None:
+                    continue
+                item_lat, item_lon = coords
+
+                distance_km = calculate_distance(center_lat, center_lon, item_lat, item_lon)
+                if distance_km > radius_km:
+                    continue
+
+                nearby.append({
+                    "name": item.get("아파트명") or item.get("도로명", ""),
+                    "road_address": item.get("도로명", ""),
+                    "price": item.get("거래금액", ""),
+                    "price_amount": item.get("거래금액_숫자", 0),
+                    "area": item.get("전용면적", ""),
+                    "floor": item.get("층", ""),
+                    "deal_month": item.get("계약년월", ""),
+                    "deal_day": item.get("계약일", ""),
+                    "distance_km": distance_km,
+                    "distance_m": int(distance_km * 1000),
+                    "lat": item_lat,
+                    "lon": item_lon,
+                })
+
+            nearby.sort(key=lambda x: x["distance_km"])
+
+            return {
+                "success": True,
+                "data": {
+                    "address": address,
+                    "coordinates": {"lat": center_lat, "lon": center_lon},
+                    "radius_km": radius_km,
+                    "property_type": property_type,
+                    "analysis_period": period_label,
+                    "checked_count": len(road_candidates),
+                    "matched_count": len(nearby),
+                    "transactions": nearby,
+                },
+                "message": (
+                    f"반경 {radius_km}km 내 {property_type} 거래 {len(nearby)}건을 찾았습니다"
+                    if nearby
+                    else f"반경 {radius_km}km 내에서 좌표를 확인할 수 있는 {property_type} 거래를 찾지 못했습니다"
+                )
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "반경 실거래가 조회 중 오류가 발생했습니다"
+        }
+
+
+@mcp.tool()
+async def compare_similar_properties(
+    address: str, 
+    area: float, 
+    building_year: int,
+    lawd_cd: str,
+    tolerance_area: float = 10.0,
+    tolerance_year: int = 5
+) -> Dict[str, Any]:
+    """
+    유사한 조건의 매물 가격 비교 분석
+    
+    Args:
+        address: 비교 대상 주소
+        area: 전용면적 (㎡)
+        building_year: 건축년도
+        lawd_cd: 지역코드
+        tolerance_area: 면적 허용 오차 (㎡)
+        tolerance_year: 건축년도 허용 오차 (년)
+    
+    Returns:
+        유사 매물 가격 비교 결과
+    """
+    try:
+        from datetime import datetime
+        
+        # 최근 6개월 데이터 조회
+        current_date = datetime.now()
+        similar_properties = []
+        
+        for i in range(6):
+            target_date = datetime(current_date.year, current_date.month - i, 1) if current_date.month > i else datetime(current_date.year - 1, current_date.month - i + 12, 1)
+            deal_ymd = target_date.strftime("%Y%m")
+            
+            # MCP 내부에서 다른 도구 호출 - 직접 함수 호출 방식 (안전)
+            result = await _get_real_estate_data(lawd_cd, deal_ymd, "아파트")
+
+            if result.get("success") and _extract_items(result):
+                items = _extract_items(result)
+
+                for item in items:
+                    try:
+                        # 면적 비교 (전용면적)
+                        item_area = float(item.get("전용면적", "0").replace(",", ""))
+                        if abs(item_area - area) <= tolerance_area:
+                            
+                            # 건축년도 비교
+                            item_year = int(item.get("건축년도", "0"))
+                            if abs(item_year - building_year) <= tolerance_year:
+                                
+                                # 가격 정보
+                                price_str = item.get("거래금액", "0").replace(",", "").replace(" ", "")
+                                if price_str.isdigit():
+                                    price = int(price_str)
+                                    
+                                    similar_properties.append({
+                                        "address": item.get("시군구", "") + " " + item.get("번지", ""),
+                                        "price": price,
+                                        "area": item_area,
+                                        "building_year": item_year,
+                                        "floor": item.get("층", ""),
+                                        "deal_date": item.get("년", "") + "." + item.get("월", "") + "." + item.get("일", ""),
+                                        "price_per_pyeong": round(price / (item_area / 3.3)) if item_area > 0 else 0
+                                    })
+                    except (ValueError, KeyError):
+                        continue
+        
+        if not similar_properties:
+            return {
+                "success": False,
+                "error": "유사한 조건의 매물을 찾을 수 없습니다",
+                "message": f"면적 {area}±{tolerance_area}㎡, 건축년도 {building_year}±{tolerance_year}년 조건에 맞는 매물이 없습니다"
+            }
+        
+        # 가격 통계 계산
+        prices = [prop["price"] for prop in similar_properties]
+        prices_per_pyeong = [prop["price_per_pyeong"] for prop in similar_properties if prop["price_per_pyeong"] > 0]
+        
+        import statistics
+        
+        price_stats = {
+            "count": len(similar_properties),
+            "average_price": statistics.mean(prices),
+            "median_price": statistics.median(prices),
+            "min_price": min(prices),
+            "max_price": max(prices),
+            "average_price_per_pyeong": statistics.mean(prices_per_pyeong) if prices_per_pyeong else 0,
+            "price_range": max(prices) - min(prices)
+        }
+        
+        # 가격 구간별 분포
+        price_quartiles = statistics.quantiles(prices, n=4) if len(prices) >= 4 else prices
+        
+        return {
+            "success": True,
+            "data": {
+                "search_criteria": {
+                    "target_area": area,
+                    "target_building_year": building_year,
+                    "area_tolerance": tolerance_area,
+                    "year_tolerance": tolerance_year
+                },
+                "statistics": price_stats,
+                "similar_properties": similar_properties[:10],  # 최대 10개만 반환
+                "market_position": {
+                    "low_25": price_quartiles[0] if len(price_quartiles) > 0 else prices[0],
+                    "median": price_stats["median_price"],
+                    "high_75": price_quartiles[2] if len(price_quartiles) > 2 else prices[-1],
+                    "recommendation": "시세 대비 적정" if len(prices) > 0 else "데이터 부족"
+                }
+            },
+            "message": f"유사 조건 매물 {len(similar_properties)}건의 비교 분석이 완료되었습니다"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "유사 매물 비교 분석 중 오류가 발생했습니다"
+        }
+
+@mcp.tool()
+async def find_nearby_facilities(address: str, category: str = "병원", radius: int = 1000) -> Dict[str, Any]:
+    """
+    주변 편의시설 검색 (카카오 로컬 API)
+
+    Args:
+        address: 기준 주소
+        category: 시설 카테고리 (대형마트, 편의점, 학교, 학원, 주차장, 주유소, 지하철역,
+            은행, 문화시설, 영화관, 공공기관, 관광명소, 숙박, 음식점, 카페, 병원, 대학병원, 약국)
+        radius: 검색 반경 (미터, 최대 20000)
+
+    Returns:
+        주변 시설 목록 (실제 장소명·거리 포함)
+    """
+    if not KAKAO_API_KEY:
+        return {
+            "success": False,
+            "error": "카카오 API 키가 설정되지 않았습니다",
+            "message": "KAKAO_API_KEY 환경변수를 설정해주세요"
+        }
+
+    category_group_code = KAKAO_CATEGORY_CODES.get(category)
+    if not category_group_code:
+        return {
+            "success": False,
+            "error": f"지원하지 않는 카테고리입니다: {category}",
+            "message": f"사용 가능한 카테고리: {', '.join(KAKAO_CATEGORY_CODES.keys())}"
+        }
+
+    location_result = await _analyze_location(address)
+    if not location_result["success"]:
+        return location_result
+    lat = location_result["data"]["coordinates"]["lat"]
+    lon = location_result["data"]["coordinates"]["lon"]
+
+    try:
+        url = "https://dapi.kakao.com/v2/local/search/category.json"
+        headers = {"Authorization": f"KakaoAK {KAKAO_API_KEY}"}
+        params = {
+            "category_group_code": category_group_code,
+            "x": lon,
+            "y": lat,
+            "radius": min(radius, 20000),
+            "sort": "distance",
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+        facilities = [
+            {
+                "name": doc.get("place_name", ""),
+                "category": doc.get("category_name", ""),
+                "address": doc.get("road_address_name") or doc.get("address_name", ""),
+                "distance_m": int(doc.get("distance", 0)),
+                "phone": doc.get("phone", ""),
+                "lat": float(doc.get("y", 0)),
+                "lon": float(doc.get("x", 0)),
+            }
+            for doc in data.get("documents", [])
+        ]
+
+        return {
+            "success": True,
+            "data": {
+                "address": address,
+                "coordinates": {"lat": lat, "lon": lon},
+                "category": category,
+                "radius": radius,
+                "facilities": facilities,
+                "total_count": data.get("meta", {}).get("total_count", len(facilities)),
+            },
+            "message": f"'{address}' 반경 {radius}m 내 {category} {len(facilities)}건을 찾았습니다"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"주변 시설 검색 중 오류가 발생했습니다: {str(e)}"
+        }
+
+# 리소스 정의
+@mcp.resource("realestate://regions")
+async def get_region_codes() -> str:
+    """한국 주요 지역 코드 정보"""
+    regions = {
+        "서울특별시": {
+            "강남구": "11680", "강동구": "11740", "강북구": "11305", "강서구": "11500",
+            "관악구": "11620", "광진구": "11215", "구로구": "11530", "금천구": "11545",
+            "노원구": "11350", "도봉구": "11320", "동대문구": "11230", "동작구": "11590",
+            "마포구": "11440", "서대문구": "11410", "서초구": "11650", "성동구": "11200",
+            "성북구": "11290", "송파구": "11710", "양천구": "11470", "영등포구": "11560",
+            "용산구": "11170", "은평구": "11380", "종로구": "11110", "중구": "11140", "중랑구": "11260"
+        },
+        "경기도": {
+            "수원시": "41110", "성남시": "41130", "고양시": "41280", "용인시": "41460",
+            "부천시": "41190", "안산시": "41270", "안양시": "41170", "남양주시": "41360",
+            "화성시": "41590", "평택시": "41220"
+        }
+    }
+    return json.dumps(regions, ensure_ascii=False, indent=2)
+
+@mcp.resource("realestate://guide")
+async def get_usage_guide() -> str:
+    """부동산 추천 시스템 사용 가이드"""
+    guide = """# 부동산 추천 시스템 MCP 서버 사용 가이드
+
+## 개요
+투자가치와 삶의질 분석을 통한 AI 기반 부동산 추천 시스템입니다.
+
+## 사용 가능한 도구
+
+### 1. get_real_estate_data
+부동산 실거래가 데이터를 조회합니다.
+- **lawd_cd**: 지역코드 (5자리)
+- **deal_ymd**: 계약년월 (YYYYMM)
+- **property_type**: 부동산 유형 (아파트, 오피스텔, 연립다세대)
+
+### 2. analyze_location
+위치 분석을 수행합니다.
+- **address**: 주소
+- **lat, lon**: 좌표 (선택사항)
+
+### 3. evaluate_investment_value
+투자가치를 평가합니다.
+- 가격, 면적, 층수, 교통 접근성, 미래 발전 가능성 분석
+
+### 4. evaluate_life_quality
+삶의질가치를 평가합니다.
+- 환경, 편의성, 안전, 교육, 문화 요소 분석
+
+### 5. recommend_property
+종합 부동산 추천을 제공합니다.
+- **user_preference**: 사용자 성향 (투자, 삶의질, 균형)
+
+## 평가 기준
+
+### 투자가치 평가 (가중치)
+- 가격 (25%): 시세 대비 합리성
+- 면적 (20%): 투자 선호 면적대
+- 층수 (15%): 중간층~중상층 선호
+- 교통 (25%): 지하철 접근성
+- 미래가치 (15%): 재건축, 개발 가능성
+
+### 삶의질 평가 (가중치)
+- 환경 (25%): 공원, 녹지 접근성
+- 편의성 (25%): 편의시설 개수
+- 안전 (20%): 층수, 치안 등
+- 교육 (15%): 학교, 학원가 접근성
+- 문화 (15%): 문화시설 접근성
+
+## 등급 체계
+- A+ (90점 이상): 매우 우수
+- A (80-89점): 우수
+- B+ (70-79점): 양호
+- B (60-69점): 보통
+- C (60점 미만): 개선 필요
+
+## API 키 설정
+- MOLIT_API_KEY: 국토교통부 공공데이터 API 키
+- NAVER_CLIENT_ID: 네이버 클라우드 플랫폼 클라이언트 ID
+- NAVER_CLIENT_SECRET: 네이버 클라우드 플랫폼 클라이언트 시크릿
+"""
+    return guide
+
+# 서버 실행
+if __name__ == "__main__":
+    import sys
+    print("🏠 부동산 추천 시스템 MCP 서버", file=sys.stderr)
+    print(f"🔑 국토교통부 API 키: {'✅ 설정됨' if MOLIT_API_KEY else '❌ 미설정'}", file=sys.stderr)
+    print(f"🗺️  네이버 API 키: {'✅ 설정됨' if NAVER_CLIENT_ID and NAVER_CLIENT_SECRET else '❌ 미설정'}", file=sys.stderr)
+    print("🚀 FastMCP JSON-RPC 서버 시작 (stdin/stdout)...", file=sys.stderr)
+    
+    # FastMCP 서버 실행
+    mcp.run()

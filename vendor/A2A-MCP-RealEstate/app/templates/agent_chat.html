@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>A2A Agent Chat - 다중 에이전트 대화</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #6366f1;
+            --secondary-color: #8b5cf6;
+            --success-color: #10b981;
+            --info-color: #06b6d4;
+            --warning-color: #f59e0b;
+            --danger-color: #ef4444;
+            --dark-color: #1f2937;
+            --light-color: #f8fafc;
+        }
+
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        .chat-container {
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            backdrop-filter: blur(10px);
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .chat-header {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 1rem;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+            backdrop-filter: blur(20px);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            flex-shrink: 0;
+        }
+        
+        .agent-selector {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+        
+        .current-agent {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: linear-gradient(45deg, var(--primary-color), var(--secondary-color));
+            color: white;
+            border-radius: 25px;
+            font-weight: 600;
+            box-shadow: 0 2px 10px rgba(99, 102, 241, 0.3);
+        }
+        
+        .agent-status {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--success-color);
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .message {
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .message.user {
+            justify-content: flex-end;
+        }
+        
+        .message.user .message-content {
+            background: linear-gradient(45deg, var(--primary-color), var(--info-color));
+            color: white;
+            margin-left: 3rem;
+        }
+        
+        .message.agent .message-content {
+            background: rgba(255, 255, 255, 0.95);
+            color: var(--dark-color);
+            margin-right: 3rem;
+            border-left: 4px solid var(--success-color);
+        }
+        
+        .message.system .message-content {
+            background: rgba(255, 255, 255, 0.8);
+            color: var(--warning-color);
+            margin: 0 2rem;
+            border-left: 4px solid var(--warning-color);
+            font-style: italic;
+        }
+        
+        .message-content {
+            padding: 1rem 1.25rem;
+            border-radius: 18px;
+            max-width: 70%;
+            word-wrap: break-word;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            position: relative;
+        }
+        
+        .message-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            color: white;
+            font-weight: bold;
+            flex-shrink: 0;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+        }
+        
+        .avatar-user {
+            background: linear-gradient(45deg, var(--primary-color), var(--info-color));
+        }
+        
+        .avatar-agent {
+            background: linear-gradient(45deg, var(--success-color), #34d399);
+        }
+        
+        .avatar-system {
+            background: linear-gradient(45deg, var(--warning-color), #fbbf24);
+        }
+        
+        .agent-name {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--success-color);
+            margin-bottom: 0.25rem;
+        }
+        
+        .chat-input {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 1.5rem;
+            border-top: 1px solid rgba(0, 0, 0, 0.1);
+            backdrop-filter: blur(20px);
+            box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.1);
+        }
+        
+        .input-group {
+            position: relative;
+        }
+        
+        .form-control {
+            border-radius: 25px;
+            border: 2px solid rgba(99, 102, 241, 0.2);
+            padding: 0.75rem 1.5rem;
+            padding-right: 60px;
+            background: rgba(255, 255, 255, 0.9);
+            transition: all 0.3s ease;
+        }
+        
+        .form-control:focus {
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 0.2rem rgba(99, 102, 241, 0.25);
+            background: white;
+        }
+        
+        .btn-send {
+            position: absolute;
+            right: 5px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: linear-gradient(45deg, var(--primary-color), var(--secondary-color));
+            border: none;
+            color: white;
+            width: 45px;
+            height: 45px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-send:hover {
+            transform: translateY(-50%) scale(1.05);
+            box-shadow: 0 4px 15px rgba(99, 102, 241, 0.4);
+        }
+        
+        .agent-list {
+            display: none !important;
+            position: relative;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.15);
+            max-height: 300px;
+            overflow-y: auto;
+            z-index: 1000;
+            margin-top: 0.5rem;
+        }
+        
+        .agent-list.visible {
+            display: block !important;
+        }
+        
+        .agent-item {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        
+        .agent-item:hover {
+            background: rgba(99, 102, 241, 0.05);
+        }
+        
+        .agent-item:last-child {
+            border-bottom: none;
+        }
+        
+        .agent-badge {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success-color);
+        }
+        
+        .agent-badge.inactive {
+            background: var(--danger-color);
+        }
+        
+        .typing-indicator {
+            display: none;
+            padding: 1rem 1.25rem;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 18px;
+            margin: 0.5rem 0;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            align-items: center;
+            gap: 0.75rem;
+            max-width: 200px;
+        }
+        
+        .typing-dots {
+            display: flex;
+            gap: 0.25rem;
+        }
+        
+        .typing-dots span {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--primary-color);
+            animation: typing 1.4s infinite;
+        }
+        
+        .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+        
+        @keyframes typing {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-8px); }
+        }
+        
+        .welcome-message {
+            text-align: center;
+            padding: 3rem 2rem;
+            color: white;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            margin: 2rem;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .welcome-message h3 {
+            margin-bottom: 1rem;
+            font-weight: 300;
+        }
+        
+        .welcome-message p {
+            font-size: 1.1rem;
+            line-height: 1.6;
+            opacity: 0.9;
+        }
+        
+        .agent-suggestions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 1rem;
+            justify-content: center;
+        }
+        
+        .suggestion-btn {
+            background: rgba(255, 255, 255, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(5px);
+        }
+        
+        .suggestion-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-1px);
+        }
+        
+        .chat-messages::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        .chat-messages::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+        }
+        
+        .chat-messages::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 3px;
+        }
+        
+        .chat-messages::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.5);
+        }
+        
+        .agent-switch-notification {
+            background: linear-gradient(45deg, var(--info-color), var(--primary-color));
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 25px;
+            margin: 1rem auto;
+            max-width: 400px;
+            text-align: center;
+            font-weight: 500;
+            box-shadow: 0 4px 20px rgba(6, 182, 212, 0.3);
+            animation: slideIn 0.5s ease-out;
+        }
+
+        .btn-toggle-agents {
+            background: rgba(255, 255, 255, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(5px);
+        }
+
+        .btn-toggle-agents:hover {
+            background: rgba(255, 255, 255, 0.3);
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <!-- 헤더 -->
+        <div class="chat-header">
+            <div class="d-flex justify-content-between align-items-center">
+                <div class="agent-selector">
+                    <div class="current-agent" id="currentAgent">
+                        <div class="agent-status"></div>
+                        <i class="fas fa-robot"></i>
+                        <span id="currentAgentName">A2A Agent</span>
+                    </div>
+                    <button class="btn btn-toggle-agents btn-sm" onclick="toggleAgentList()">
+                        <i class="fas fa-users"></i> 에이전트 선택
+                    </button>
+                </div>
+                <div>
+                    <button class="btn btn-outline-light btn-sm" onclick="clearChat()">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+            </div>
+            
+            <!-- 에이전트 목록 -->
+            <div class="agent-list" id="agentList" style="position: relative; margin-top: 1rem;">
+                <!-- 동적으로 로드됨 -->
+            </div>
+        </div>
+        
+        <!-- 채팅 메시지 영역 -->
+        <div class="chat-messages" id="chatMessages">
+            <div class="welcome-message">
+                <h3>🤖 A2A Multi-Agent Chat</h3>
+                <p>자연어로 다양한 전문 에이전트와 대화해보세요!<br>
+                예: "소크라테스와 이야기하고 싶어", "부동산 투자 도움"</p>
+                
+                <div class="agent-suggestions">
+                    <button class="suggestion-btn" onclick="toggleAgentList()" style="background: linear-gradient(45deg, #667eea, #764ba2); color: white; font-weight: bold; margin-bottom: 1rem; width: 100%;">
+                        👥 에이전트 선택 (클릭하세요!)
+                    </button>
+                    
+                    <!-- 에이전트 목록 -->
+                    <div class="agent-list" id="agentList" style="margin-bottom: 1rem; width: 100%; background: rgba(255,255,255,0.9); border-radius: 10px; padding: 10px; min-height: 50px;">
+                        <!-- 동적으로 로드됨 -->
+                    </div>
+                    
+                    <button class="suggestion-btn" onclick="sendSuggestion('소크라테스와 이야기하고 싶어')">
+                        💭 소크라테스와 대화
+                    </button>
+                    <button class="suggestion-btn" onclick="sendSuggestion('부동산 투자 도움이 필요해')">
+                        🏠 부동산 상담
+                    </button>
+                    <button class="suggestion-btn" onclick="sendSuggestion('취업 준비를 도와줘')">
+                        💼 취업 상담
+                    </button>
+                    <button class="suggestion-btn" onclick="sendSuggestion('웹3에 대해 배우고 싶어')">
+                        🌐 Web3 학습
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 타이핑 인디케이터 -->
+        <div class="typing-indicator" id="typingIndicator">
+            <div class="typing-dots">
+                <span></span>
+                <span></span>
+                <span></span>
+            </div>
+            <span id="typingText">에이전트가 응답 중...</span>
+        </div>
+        
+        <!-- 입력 영역 -->
+        <div class="chat-input">
+            <div class="input-group">
+                <input type="text" class="form-control" id="messageInput" 
+                       placeholder="자연어로 에이전트와 대화해보세요..." 
+                       onkeypress="handleKeyPress(event)">
+                <button type="button" class="btn-send" onclick="sendMessage()">
+                    <i class="fas fa-paper-plane"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let currentSession = null;
+        let availableAgents = [];
+        let agentListVisible = false;
+
+        // 초기화
+        async function initialize() {
+            await loadAvailableAgents();
+            showWelcome();
+        }
+
+        // 에이전트 목록 로드
+        async function loadAvailableAgents() {
+            try {
+                console.log('에이전트 목록을 로드하고 있습니다...');
+                const response = await fetch('/api/registry/agents');
+                console.log('API 응답:', response.status, response.statusText);
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    console.log('받은 데이터:', data);
+                    availableAgents = data.agents || [];
+                    console.log('로드된 에이전트 수:', availableAgents.length);
+                    renderAgentList();
+                } else {
+                    console.error('API 요청 실패:', response.status, response.statusText);
+                }
+            } catch (error) {
+                console.error('에이전트 목록 로드 실패:', error);
+            }
+        }
+
+        // 에이전트 목록 렌더링
+        function renderAgentList() {
+            const agentList = document.getElementById('agentList');
+            console.log('렌더링 시작 - 에이전트 목록 element:', agentList);
+            console.log('렌더링할 에이전트 수:', availableAgents.length);
+            
+            if (!availableAgents.length) {
+                agentList.innerHTML = '<div class="p-3 text-muted">등록된 에이전트가 없습니다.</div>';
+                console.log('에이전트가 없음 - 기본 메시지 표시');
+                return;
+            }
+
+            const agentHTML = availableAgents.map(agent => `
+                <div class="agent-item" onclick="selectAgent('${agent.agent_id}', '${agent.name}')" style="background: rgba(255,255,255,0.9); margin-bottom: 5px; border-radius: 5px;">
+                    <div class="agent-badge ${agent.status === 'active' ? '' : 'inactive'}"></div>
+                    <div>
+                        <div class="fw-bold" style="color: #333;">${agent.name}</div>
+                        <div class="text-muted small" style="color: #666;">${agent.specialty || agent.description}</div>
+                    </div>
+                </div>
+            `).join('');
+
+            console.log('생성된 HTML:', agentHTML.substring(0, 200) + '...');
+            agentList.innerHTML = agentHTML;
+            console.log('HTML이 설정되었습니다. 현재 innerHTML 길이:', agentList.innerHTML.length);
+        }
+
+        // 에이전트 목록 토글
+        function toggleAgentList() {
+            const agentList = document.getElementById('agentList');
+            agentListVisible = !agentListVisible;
+            
+            // CSS 클래스를 사용해서 display 제어
+            if (agentListVisible) {
+                agentList.classList.add('visible');
+                console.log('에이전트 목록 표시됨');
+            } else {
+                agentList.classList.remove('visible');
+                console.log('에이전트 목록 숨김');
+            }
+            
+            // 디버깅: 에이전트 목록이 비어있으면 강제로 로드
+            if (availableAgents.length === 0) {
+                console.log('에이전트 목록이 비어있습니다. 다시 로드합니다...');
+                loadAvailableAgents();
+            }
+            
+            console.log('에이전트 목록 토글:', agentListVisible, '에이전트 수:', availableAgents.length);
+            console.log('agentList 클래스:', agentList.className);
+        }
+
+        // 에이전트 선택
+        async function selectAgent(agentId, agentName) {
+            try {
+                // 에이전트 목록 숨기기
+                agentListVisible = true; // toggleAgentList이 이를 false로 만들어 숨김
+                toggleAgentList();
+                showTyping(agentName);
+                
+                // 수동 에이전트 전환 API 호출
+                const response = await fetch('/api/smart-chat/switch-agent', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        agent_id: agentId,
+                        initial_message: `안녕하세요! ${agentName}와 대화하고 싶습니다.`
+                    })
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('currentAgentName').textContent = agentName;
+                    currentSession = data.session_id;
+                    
+                    hideTyping();
+                    addAgentSwitchNotification(`${agentName}와 연결되었습니다!`);
+                    
+                    if (data.initial_response) {
+                        addMessage('agent', data.initial_response.content, agentName);
+                    }
+                } else {
+                    hideTyping();
+                    addSystemMessage(`${agentName} 연결에 실패했습니다.`);
+                }
+            } catch (error) {
+                hideTyping();
+                addSystemMessage(`연결 오류: ${error.message}`);
+            }
+        }
+
+        // 키 입력 처리
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+
+        // 제안 메시지 전송
+        function sendSuggestion(message) {
+            document.getElementById('messageInput').value = message;
+            sendMessage();
+        }
+
+        // 메시지 전송
+        async function sendMessage() {
+            const messageInput = document.getElementById('messageInput');
+            const message = messageInput.value.trim();
+            
+            if (!message) return;
+            
+            // 사용자 메시지 추가
+            addMessage('user', message, 'You');
+            messageInput.value = '';
+            
+            // 타이핑 표시
+            showTyping();
+            
+            try {
+                const response = await fetch('/api/smart-chat/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        message: message,
+                        auto_switch: true,
+                        session_id: currentSession
+                    })
+                });
+                
+                const data = await response.json();
+                hideTyping();
+                
+                if (response.ok) {
+                    handleChatResponse(data);
+                } else {
+                    addSystemMessage(`오류: ${data.detail || '알 수 없는 오류가 발생했습니다.'}`);
+                }
+                
+            } catch (error) {
+                hideTyping();
+                addSystemMessage(`연결 오류: ${error.message}`);
+            }
+        }
+
+        // 채팅 응답 처리
+        function handleChatResponse(data) {
+            if (data.session_id) {
+                currentSession = data.session_id;
+            }
+
+            // 에이전트 전환 알림
+            if (data.action === 'agent_switched') {
+                if (data.switch_message) {
+                    addAgentSwitchNotification(data.switch_message);
+                }
+                if (data.switched_to) {
+                    document.getElementById('currentAgentName').textContent = data.switched_to;
+                }
+            }
+
+            // 에이전트 추천 알림
+            if (data.action === 'agent_recommended' && data.recommendation_message) {
+                addSystemMessage(data.recommendation_message);
+            }
+
+            // 에이전트 응답
+            if (data.agent_response) {
+                const agentResp = data.agent_response;
+                const senderName = agentResp.sender || 'Assistant';
+                const content = agentResp.content || '';
+                
+                addMessage('agent', content, senderName);
+            }
+        }
+
+        // 메시지 추가
+        function addMessage(type, content, sender) {
+            const messagesContainer = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${type}`;
+            
+            let avatarClass = `avatar-${type}`;
+            let avatarText = type === 'user' ? 'U' : (sender ? sender.charAt(0).toUpperCase() : 'A');
+            
+            // 환영 메시지 숨기기
+            hideWelcome();
+            
+            messageDiv.innerHTML = `
+                <div class="message-avatar ${avatarClass}">${avatarText}</div>
+                <div class="message-content">
+                    ${type === 'agent' ? `<div class="agent-name">${sender}</div>` : ''}
+                    ${content.replace(/\n/g, '<br>')}
+                </div>
+            `;
+            
+            messagesContainer.appendChild(messageDiv);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        // 시스템 메시지 추가
+        function addSystemMessage(content) {
+            const messagesContainer = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message system';
+            
+            hideWelcome();
+            
+            messageDiv.innerHTML = `
+                <div class="message-avatar avatar-system">!</div>
+                <div class="message-content">${content}</div>
+            `;
+            
+            messagesContainer.appendChild(messageDiv);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        // 에이전트 전환 알림
+        function addAgentSwitchNotification(message) {
+            const messagesContainer = document.getElementById('chatMessages');
+            const notificationDiv = document.createElement('div');
+            notificationDiv.className = 'agent-switch-notification';
+            notificationDiv.innerHTML = `<i class="fas fa-exchange-alt me-2"></i>${message}`;
+            
+            hideWelcome();
+            messagesContainer.appendChild(notificationDiv);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        // 타이핑 표시/숨김
+        function showTyping(agentName = '에이전트') {
+            const indicator = document.getElementById('typingIndicator');
+            document.getElementById('typingText').textContent = `${agentName}가 응답 중...`;
+            indicator.style.display = 'flex';
+            
+            const messagesContainer = document.getElementById('chatMessages');
+            messagesContainer.appendChild(indicator);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        function hideTyping() {
+            const indicator = document.getElementById('typingIndicator');
+            indicator.style.display = 'none';
+        }
+
+        // 환영 메시지 표시/숨김
+        function showWelcome() {
+            const welcome = document.querySelector('.welcome-message');
+            if (welcome) welcome.style.display = 'block';
+        }
+
+        function hideWelcome() {
+            const welcome = document.querySelector('.welcome-message');
+            if (welcome) welcome.style.display = 'none';
+        }
+
+        // 채팅 초기화
+        function clearChat() {
+            const messagesContainer = document.getElementById('chatMessages');
+            messagesContainer.innerHTML = '';
+            currentSession = null;
+            showWelcome();
+            hideTyping();
+        }
+
+        // 문서 클릭 이벤트 (에이전트 목록 숨김)
+        document.addEventListener('click', function(event) {
+            const agentList = document.getElementById('agentList');
+            const toggleBtn = document.querySelector('.btn-toggle-agents');
+            
+            if (!agentList.contains(event.target) && !toggleBtn.contains(event.target)) {
+                agentListVisible = false;
+                agentList.style.display = 'none';
+            }
+        });
+
+        // 페이지 로드 시 초기화
+        window.addEventListener('load', initialize);
+    </script>
+</body>
+</html>

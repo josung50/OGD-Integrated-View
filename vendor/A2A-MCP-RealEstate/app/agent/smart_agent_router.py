@@ -1,0 +1,410 @@
+"""
+Smart Agent Router
+자연어로 에이전트 전환 및 대화 라우팅
+"""
+
+import re
+import asyncio
+from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime
+from pydantic import BaseModel
+import httpx
+from loguru import logger
+
+from .multi_agent_conversation import MultiAgentConversation, ConversationMessage
+from .a2a_agent import A2AAgent
+from .agent_registry import agent_registry, RegistryAgent
+from .external_agent_adapter import external_agent_manager
+
+
+class AgentProfile(BaseModel):
+    """에이전트 프로필"""
+    agent_id: str
+    name: str
+    aliases: List[str]  # 별명들
+    keywords: List[str]  # 관련 키워드들
+    description: str
+    url: str
+    capabilities: List[str]
+    personality_traits: List[str] = []
+
+
+class SmartAgentRouter:
+    """스마트 에이전트 라우터"""
+    
+    def __init__(self, conversation_manager: MultiAgentConversation):
+        self.conversation_manager = conversation_manager
+        self.current_session_id: Optional[str] = None
+        self.current_agent_id: Optional[str] = None
+        self.latest_response: Optional[ConversationMessage] = None
+        
+        # 미리 정의된 에이전트 프로필들
+        self.agent_profiles: Dict[str, AgentProfile] = self._initialize_agent_profiles()
+        
+        # 자연어 패턴들
+        self.switch_patterns = [
+            # 직접 이름 언급
+            r"(.*?)(소크라테스|socrates|socratic)(.*)이야기.*하고?\s*싶",
+            r"(.*?)(소크라테스|socrates|socratic)(.*)대화.*하고?\s*싶",
+            r"(.*?)(소크라테스|socrates|socratic)(.*)말.*하고?\s*싶",
+            r"(.*?)(소크라테스|socrates|socratic)(.*)와\s*함께",
+            r"(.*?)(소크라테스|socrates|socratic)(.*)에게.*물어",
+            
+            # 전환 표현
+            r"(.*)에이전트(.*)바꿔",
+            r"(.*)다른(.*)에이전트",
+            r"(.*)전환.*해",
+            r"(.*)바꿔.*줘",
+            
+            # 명시적인 에이전트 요청만 - 단순히 주제를 언급하는 것이 아니라 에이전트/튜터를 명확히 요청하는 경우만
+            r"(.*)(웹3|web3|블록체인|blockchain)(.*)에이전트",
+            r"(.*)(웹3|web3|블록체인|blockchain)(.*)튜터(.*)연결",
+            r"(.*)(웹3|web3|블록체인|blockchain)(.*)전문가(.*)연결",
+            r"(.*)(소크라테스|socratic)(.*)연결",
+            
+            # 부동산 관련 전환
+            r"(.*)(부동산|real\s*estate)(.*)도움",
+            r"(.*)(부동산|real\s*estate)(.*)상담",
+            r"(.*)(부동산|real\s*estate)(.*)투자",
+            r"(.*)(부동산|real\s*estate)(.*)분석",
+            r"(.*)(부동산|real\s*estate)(.*)추천",
+            r"(.*)(집|아파트|매물)(.*)찾",
+            r"(.*)(투자|매매)(.*)상담",
+            
+            # 취업/커리어 관련 전환
+            r"(.*)(취업|job|career)(.*)도움",
+            r"(.*)(취업|job|career)(.*)준비",
+            r"(.*)(취업|job|career)(.*)상담",
+            r"(.*)(이력서|resume)(.*)도움",
+            r"(.*)(면접|interview)(.*)준비",
+            r"(.*)(구직|job\s*search)(.*)도움",
+            
+            # 문서 작성 관련 전환
+            r"(.*)(문서|document)(.*)작성",
+            r"(.*)(문서|document)(.*)도움",
+            r"(.*)(보고서|report)(.*)작성",
+            r"(.*)(글쓰기|writing)(.*)도움",
+            r"(.*)(제안서|proposal)(.*)작성",
+            
+            # 스포츠/야구 관련 전환
+            r"(.*)(야구|baseball|mlb)(.*)분석",
+            r"(.*)(야구|baseball|mlb)(.*)통계",
+            r"(.*)(야구|baseball|mlb)(.*)정보",
+            r"(.*)(스포츠|sports)(.*)분석",
+            
+            # 연구/실험 관련 전환  
+            r"(.*)(연구|research)(.*)도움",
+            r"(.*)(ai|인공지능)(.*)연구",
+            r"(.*)(실험|experiment)(.*)설계",
+            r"(.*)(lab|연구소|연구실)(.*)질문",
+            
+            # 튜터/선생님 요청
+            r"(.*)선생님(.*)바꿔",
+            r"(.*)튜터(.*)바꿔",
+            r"(.*)가르쳐(.*)줄(.*)에이전트"
+        ]
+    
+    def _initialize_agent_profiles(self) -> Dict[str, AgentProfile]:
+        """에이전트 프로필 초기화 (레지스트리에서 로드)"""
+        profiles = {}
+        
+        # 레지스트리에서 모든 활성 에이전트 로드
+        for registry_agent in agent_registry.get_all_agents(active_only=True):
+            profile = AgentProfile(
+                agent_id=registry_agent.agent_id,
+                name=registry_agent.name,
+                aliases=registry_agent.aliases,
+                keywords=registry_agent.keywords,
+                description=registry_agent.description,
+                url=registry_agent.base_url,
+                capabilities=registry_agent.capabilities,
+                personality_traits=registry_agent.personality_traits
+            )
+            profiles[profile.agent_id] = profile
+        
+        logger.info(f"Initialized {len(profiles)} agent profiles from registry")
+        return profiles
+    
+    async def process_message(self, user_message: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        사용자 메시지를 분석해서 에이전트 전환이 필요한지 판단
+        
+        Returns:
+            (agent_switch_needed, target_agent_id, response_message)
+        """
+        
+        # 1. 직접적인 에이전트 전환 요청 감지만 처리
+        switch_result = self._detect_agent_switch_request(user_message)
+        if switch_result[0]:
+            return switch_result
+        
+        # 2. 자동 추천은 제거 - 사용자가 현재 에이전트와 대화 중일 때는 방해하지 않음
+        # (기존의 자동 추천 로직 제거하여 unwanted switching 방지)
+        
+        # 3. 기본적으로 전환 없음
+        return False, None, None
+    
+    def _detect_agent_switch_request(self, message: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """직접적인 에이전트 전환 요청 감지"""
+        message_lower = message.lower().strip()
+        
+        for pattern in self.switch_patterns:
+            match = re.search(pattern, message_lower, re.IGNORECASE)
+            if match:
+                logger.info(f"Agent switch pattern matched: {pattern}")
+                
+                # 어떤 에이전트를 원하는지 분석
+                target_agent = self._identify_target_agent(message)
+                if target_agent:
+                    agent_profile = self.agent_profiles[target_agent]
+                    return True, target_agent, f"네! {agent_profile.name}와 대화해드릴게요. 잠시만 기다려주세요..."
+                else:
+                    return True, "socratic-web3-tutor", "소크라테스 튜터와 연결해드릴게요!"
+        
+        return False, None, None
+    
+    def _identify_target_agent(self, message: str) -> Optional[str]:
+        """메시지에서 대상 에이전트 식별 (레지스트리 사용)"""
+        message_lower = message.lower()
+        
+        # 주제별 키워드 매칭 (우선순위)
+        if any(keyword in message_lower for keyword in ['부동산', 'real estate', '집', '아파트', '매물']):
+            return "a2a-mcp-realestate"
+        if any(keyword in message_lower for keyword in ['취업', 'job', 'career', '이력서', 'resume', '면접', 'interview', '구직']):
+            return "job-search-agent"
+        if any(keyword in message_lower for keyword in ['문서', 'document', '보고서', 'report', '글쓰기', 'writing', '제안서', 'proposal']):
+            return "document-generator"
+        if any(keyword in message_lower for keyword in ['야구', 'baseball', 'mlb', '스포츠', 'sports']):
+            return "mlb-sports-agent"
+        if any(keyword in message_lower for keyword in ['연구', 'research', 'lab', '연구소', '연구실', '실험', 'experiment']):
+            return "web3-ai-lab"
+        
+        # 레지스트리에서 별명으로 검색
+        for word in message_lower.split():
+            agent = agent_registry.get_agent_by_alias(word)
+            if agent and agent.agent_id in self.agent_profiles:
+                return agent.agent_id
+        
+        # 기존 프로필에서도 검색 (백업)
+        for agent_id, profile in self.agent_profiles.items():
+            for alias in profile.aliases:
+                if alias.lower() in message_lower:
+                    return agent_id
+            if profile.name.lower() in message_lower:
+                return agent_id
+        
+        return None
+    
+    def _recommend_agent_by_keywords(self, message: str) -> Optional[str]:
+        """키워드 기반 에이전트 추천"""
+        message_lower = message.lower()
+        
+        agent_scores = {}
+        
+        for agent_id, profile in self.agent_profiles.items():
+            score = 0
+            for keyword in profile.keywords:
+                if keyword.lower() in message_lower:
+                    score += 1
+            
+            if score > 0:
+                agent_scores[agent_id] = score
+        
+        if agent_scores:
+            # 가장 높은 점수의 에이전트 반환
+            best_agent = max(agent_scores, key=agent_scores.get)
+            return best_agent
+        
+        return None
+    
+    async def switch_to_agent(self, agent_id: str, initial_message: str = None) -> Dict[str, Any]:
+        """지정된 에이전트로 전환"""
+        try:
+            # 1. 에이전트가 등록되어 있는지 확인
+            if agent_id not in self.agent_profiles:
+                return {"success": False, "error": f"Unknown agent: {agent_id}"}
+            
+            profile = self.agent_profiles[agent_id]
+            
+            # 2. 외부 에이전트 어댑터를 사용해서 연결
+            logger.info(f"Attempting to connect to external agent: {profile.name}")
+            
+            # 에이전트 정보 조회
+            registry_agent = agent_registry.get_agent_by_id(agent_id)
+            if not registry_agent:
+                return {"success": False, "error": f"Agent {agent_id} not found in registry"}
+            
+            agent_info = {
+                "name": registry_agent.name,
+                "description": registry_agent.description,
+                "agent_id": agent_id
+            }
+            
+            # 3. 세션 생성 (간단한 UUID 형태)
+            import uuid
+            session_id = f"session_{agent_id}_{uuid.uuid4().hex[:8]}"
+            
+            self.current_session_id = session_id
+            self.current_agent_id = agent_id
+            
+            # 4. 초기 메시지가 있다면 외부 에이전트에게 전송
+            if initial_message:
+                response = await external_agent_manager.send_message(
+                    agent_id, 
+                    registry_agent.base_url, 
+                    agent_info, 
+                    initial_message
+                )
+                
+                # 응답을 대화 히스토리에 저장
+                if response.get("success"):
+                    self.latest_response = ConversationMessage(
+                        message_id=f"msg_{uuid.uuid4().hex[:8]}",
+                        conversation_id=session_id,
+                        sender_id=agent_id,
+                        sender_name=response.get("sender", profile.name),
+                        content=response.get("content", ""),
+                        timestamp=datetime.now()
+                    )
+                    logger.info(f"Received response from {agent_id}")
+            
+            return {
+                "success": True,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "agent_name": profile.name,
+                "message": f"{profile.name}와 연결되었습니다!"
+            }
+            
+        except Exception as e:
+            logger.error(f"Agent switch failed: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def send_message_to_current_agent(self, message: str) -> Dict[str, Any]:
+        """현재 활성화된 에이전트에게 메시지 전송"""
+        if not self.current_session_id or not self.current_agent_id:
+            return {"success": False, "error": "No active agent session"}
+        
+        try:
+            # 레지스트리에서 에이전트 정보 조회
+            registry_agent = agent_registry.get_agent_by_id(self.current_agent_id)
+            if not registry_agent:
+                return {"success": False, "error": f"Agent {self.current_agent_id} not found in registry"}
+            
+            agent_info = {
+                "name": registry_agent.name,
+                "description": registry_agent.description,
+                "agent_id": self.current_agent_id
+            }
+            
+            # 외부 에이전트에게 메시지 전송
+            response = await external_agent_manager.send_message(
+                self.current_agent_id,
+                registry_agent.base_url,
+                agent_info,
+                message
+            )
+            
+            # 응답을 대화 히스토리에 저장
+            if response.get("success"):
+                import uuid
+                self.latest_response = ConversationMessage(
+                    message_id=f"msg_{uuid.uuid4().hex[:8]}",
+                    conversation_id=self.current_session_id,
+                    sender_id=self.current_agent_id,
+                    sender_name=response.get("sender", registry_agent.name),
+                    content=response.get("content", ""),
+                    timestamp=datetime.now()
+                )
+            
+            return {
+                "success": response.get("success", False),
+                "session_id": self.current_session_id,
+                "response": response
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to send message to current agent: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def get_latest_response(self, timeout_seconds: int = 10) -> Optional[ConversationMessage]:
+        """현재 세션에서 최신 응답 가져오기"""
+        if not self.current_session_id:
+            return None
+        
+        try:
+            # 먼저 latest_response 확인 (switch_to_agent에서 저장된 응답)
+            if hasattr(self, 'latest_response') and self.latest_response:
+                if self.latest_response.conversation_id == self.current_session_id:
+                    response = self.latest_response
+                    # 응답 사용 후 초기화하여 중복 사용 방지
+                    self.latest_response = None
+                    return response
+            
+            # conversation manager 히스토리에서 확인
+            for _ in range(timeout_seconds):
+                messages = await self.conversation_manager.get_conversation_history(
+                    self.current_session_id, limit=5
+                )
+                
+                if messages:
+                    # 에이전트의 최신 메시지 찾기
+                    for msg in reversed(messages):
+                        if (msg.sender_id == self.current_agent_id or 
+                            msg.sender_id != self.conversation_manager.local_agent.agent_id):
+                            return msg
+                
+                await asyncio.sleep(1)
+                
+        except Exception as e:
+            logger.error(f"Failed to get latest response: {e}")
+        
+        return None
+    
+    def get_current_agent_info(self) -> Optional[Dict[str, Any]]:
+        """현재 활성 에이전트 정보"""
+        if not self.current_agent_id:
+            return None
+        
+        if self.current_agent_id in self.agent_profiles:
+            profile = self.agent_profiles[self.current_agent_id]
+            return {
+                "agent_id": profile.agent_id,
+                "name": profile.name,
+                "description": profile.description,
+                "capabilities": profile.capabilities,
+                "session_id": self.current_session_id
+            }
+        
+        return None
+    
+    def list_available_agents(self) -> List[Dict[str, Any]]:
+        """사용 가능한 에이전트 목록"""
+        return [
+            {
+                "agent_id": profile.agent_id,
+                "name": profile.name,
+                "aliases": profile.aliases,
+                "keywords": profile.keywords[:5],  # 처음 5개만
+                "description": profile.description
+            }
+            for profile in self.agent_profiles.values()
+        ]
+    
+    async def reset_session(self):
+        """현재 세션 리셋"""
+        if self.current_session_id:
+            await self.conversation_manager.end_conversation(self.current_session_id)
+        
+        self.current_session_id = None
+        self.current_agent_id = None
+    
+    def get_switch_examples(self) -> List[str]:
+        """에이전트 전환 예시 문장들"""
+        return [
+            "소크라테스와 이야기하고 싶어",
+            "Web3에 대해 배우고 싶어",
+            "블록체인 튜터로 바꿔줘",
+            "다른 에이전트와 대화하고 싶어",
+            "AI 전문가에게 질문하고 싶어"
+        ]
