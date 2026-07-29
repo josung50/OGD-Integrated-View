@@ -3,6 +3,7 @@ import sys
 import streamlit as st
 from dotenv import load_dotenv
 
+from ogd_integrated_view.dashboard.gemini_test import render_gemini_test_tab
 from ogd_integrated_view.dashboard.location_dashboard import render_location_dashboard
 from ogd_integrated_view.dashboard.settings import render_settings_tab
 
@@ -17,10 +18,15 @@ def main() -> None:
     st.title("OGD Integrated View")
     st.write("주소를 입력해 주변 입지 정보를 지도로 확인해보세요.")
 
-    tab_location_analysis, tab_settings = st.tabs(["📍 부동산 입지분석", "⚙️ 설정"])
+    tab_location_analysis, tab_gemini_test, tab_settings = st.tabs(
+        ["📍 부동산 입지분석", "🤖 제미나이 테스트", "⚙️ 설정"]
+    )
 
     with tab_location_analysis:
         render_location_dashboard()
+
+    with tab_gemini_test:
+        render_gemini_test_tab()
 
     with tab_settings:
         render_settings_tab()

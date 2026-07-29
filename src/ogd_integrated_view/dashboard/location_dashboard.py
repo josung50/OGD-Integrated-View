@@ -6,6 +6,7 @@ import streamlit as st
 from ogd_integrated_view.dashboard.chat import render_chat_tab
 from ogd_integrated_view.dashboard.kakao_map import CATEGORY_META, render_kakao_map
 from ogd_integrated_view.dashboard.backend import query_location_analysis
+from ogd_integrated_view.mcp.gemini_scraper import ask_gemini, ensure_browser_open
 from ogd_integrated_view.mcp.hogangnono_scraper import (
     AI_SUMMARY_CATEGORIES,
     HogangnonoNoReviewData,
@@ -197,6 +198,9 @@ def render_location_dashboard() -> None:
         answer = f"반경 내 총 상가 {commercial['total_count']:,}건{sample_note}\n\n{lines}"
         return {"answer": answer, "map": None}
 
+    def _query_gemini(question: str) -> dict:
+        return _ask_gemini_about_result(result, question)
+
     st.divider()
     with st.expander("💬 추가로 질문하기 (AI에게 자유롭게 물어보기)"):
         st.caption(f"현재 '{address_context}' 기준으로 질문에 답합니다.")
@@ -211,6 +215,75 @@ def render_location_dashboard() -> None:
                 "상권": _query_commercial_district,
             },
         )
+
+    with st.expander("🔮 Gemini에게 질문하기 (위에서 조회한 데이터 기반)"):
+        st.caption(
+            f"현재 '{address_context}' 기준으로 조회된 지하철역/편의시설/실거래/상권 데이터를 "
+            "Gemini에게 전달해 질문에 답합니다. Gemini는 이 데이터 안에서만 답하며, 스스로 "
+            "새 정보를 추가 조회하지는 않습니다 (설정 탭에서 로그인 필요)."
+        )
+        render_chat_tab(
+            session_key="location_analysis_gemini_chat",
+            description="조회된 데이터를 Gemini에게 넘겨 질문합니다.",
+            placeholder="예: 이 지역 상권이 활발한 편이야?",
+            examples=["상권이 활발한 편이야?", "학군 관련 시설이 잘 갖춰져 있어?"],
+            query_fn=_query_gemini,
+        )
+
+
+_GEMINI_CATEGORY_LABELS = {
+    "subway": "지하철역",
+    "convenience": "편의시설",
+    "infra": "주요 인프라",
+    "schools": "학교",
+}
+_GEMINI_MAX_EXAMPLES_PER_CATEGORY = 10
+_GEMINI_MAX_TRANSACTION_EXAMPLES = 15
+
+
+def _build_location_context_text(result: dict) -> str:
+    """Gemini는 MCP tool을 직접 호출할 수 없어(스크래핑 방식이라 tool-calling 불가),
+    이미 조회해둔 위치분석 결과를 텍스트로 요약해 질문 앞에 붙여준다 — Gemini는
+    이 텍스트 안의 내용만으로 답해야 한다."""
+    lines = [f"[분석 대상 주소: {result['center']['label']}]"]
+
+    for key, label in _GEMINI_CATEGORY_LABELS.items():
+        points = result["categories"].get(key, [])
+        if not points:
+            continue
+        examples = ", ".join(
+            f"{p['name']}({p['distance_m']}m)" for p in points[:_GEMINI_MAX_EXAMPLES_PER_CATEGORY]
+        )
+        lines.append(f"- {label} {len(points)}곳: {examples}")
+
+    transactions = result["categories"].get("transactions", [])
+    if transactions:
+        examples = ", ".join(
+            f"{t['name']}({t.get('detail', '')}, {t.get('date', '')})"
+            for t in transactions[:_GEMINI_MAX_TRANSACTION_EXAMPLES]
+        )
+        lines.append(f"- 아파트 실거래 {len(transactions)}건(최신순 일부): {examples}")
+
+    commercial = result.get("commercial")
+    if commercial and commercial.get("by_category"):
+        top = ", ".join(f"{row['category']} {row['count']}건" for row in commercial["by_category"][:8])
+        lines.append(f"- 상권: 반경 내 총 상가 {commercial['total_count']:,}건, 업종별 개수: {top}")
+
+    return "\n".join(lines)
+
+
+def _ask_gemini_about_result(result: dict, question: str) -> dict:
+    context_text = _build_location_context_text(result)
+    try:
+        ensure_browser_open()
+        answer = asyncio.run(
+            ask_gemini(
+                f"{context_text}\n\n위 데이터를 바탕으로 다음 질문에 답해줘: {question}"
+            )
+        )
+    except Exception as exc:
+        answer = f"Gemini 질의 중 오류가 발생했습니다: {exc}"
+    return {"answer": answer, "map": None}
 
 
 def _extract_summary_paragraph(raw_text: str) -> str | None:
